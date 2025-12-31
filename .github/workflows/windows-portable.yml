@@ -28,11 +28,6 @@ jobs:
         shell: bash
         run: git clone --depth 1 https://github.com/${XDELTA_REPO}.git xdelta
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 

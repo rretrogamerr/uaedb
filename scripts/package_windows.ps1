@@ -1,6 +1,5 @@
 param(
     [string]$OutputDir = "dist\\uaedb-portable",
-    [string]$Python = "python",
     [string]$XdeltaPath = ""
 )
 
@@ -34,6 +33,39 @@ function Find-LicensePath {
     return $null
 }
 
+function Sanitize-Name {
+    param([string]$Name)
+    return [regex]::Replace($Name, "[^A-Za-z0-9._-]+", "_")
+}
+
+function Write-ThirdPartyNotices {
+    param(
+        [string]$LicenseDir,
+        [array]$Includes
+    )
+
+    $lines = @(
+        "# Third-Party Notices",
+        ""
+    )
+
+    foreach ($item in $Includes) {
+        $path = $item.Path
+        $name = $item.Name
+        if (-not $path -or -not (Test-Path $path)) {
+            continue
+        }
+        $base = Split-Path -Leaf $path
+        $targetName = Sanitize-Name "$name-$base"
+        $targetPath = Join-Path $LicenseDir $targetName
+        Copy-Item $path $targetPath -Force
+        $lines += "- $name - $targetName"
+    }
+
+    $summaryPath = Join-Path $LicenseDir "THIRD_PARTY_NOTICES.md"
+    Set-Content -Path $summaryPath -Value $lines -Encoding utf8
+}
+
 Write-Host "Building UAEDB..."
 cargo build --release
 
@@ -58,16 +90,11 @@ if (-not $xdeltaLicense) {
     throw "LICENSE not found for xdelta starting from: $xdeltaDir"
 }
 
-$pydepsDir = Join-Path $env:TEMP "uaedb-pydeps"
-if (Test-Path $pydepsDir) {
-    Remove-Item $pydepsDir -Recurse -Force
-}
-New-Item -ItemType Directory -Force -Path $pydepsDir | Out-Null
-
 Write-Host "Collecting licenses..."
-& $Python "$root\\scripts\\collect_licenses.py" --pydeps "$pydepsDir" --out "$OutputDir\\licenses" --include "$xdeltaLicense"
-
-Remove-Item $pydepsDir -Recurse -Force
+$includes = @(
+    @{ Name = "xdelta"; Path = $xdeltaLicense }
+)
+Write-ThirdPartyNotices -LicenseDir "$OutputDir\\licenses" -Includes $includes
 
 Write-Host "Creating zip archive..."
 $zipPath = "$OutputDir.zip"
