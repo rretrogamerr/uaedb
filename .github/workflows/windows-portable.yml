@@ -54,16 +54,38 @@ jobs:
       - name: Install xz (liblzma)
         shell: pwsh
         run: |
-          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
-          & "$vcpkgRoot\vcpkg.exe" install xz:x64-windows
+          $ErrorActionPreference = "Stop"
+          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT -and (Test-Path "$env:VCPKG_INSTALLATION_ROOT\\vcpkg.exe")) { $env:VCPKG_INSTALLATION_ROOT } else { "" }
+          $needsClone = $false
+          if (-not $vcpkgRoot) { $needsClone = $true }
+          elseif (-not (Test-Path "$vcpkgRoot\\ports\\xz") -and -not (Test-Path "$vcpkgRoot\\ports\\liblzma")) { $needsClone = $true }
+          if ($needsClone) {
+            $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+            git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+            & "$vcpkgRoot\\bootstrap-vcpkg.bat"
+          }
+          $triplet = "x64-windows-static"
+          $env:VCPKG_ROOT = $vcpkgRoot
           "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_TRIPLET=$triplet" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $installOk = $false
+          foreach ($port in @("xz", "liblzma")) {
+            try {
+              & "$vcpkgRoot\\vcpkg.exe" install "$port:$triplet"
+              if ($LASTEXITCODE -eq 0) { $installOk = $true; break }
+            } catch {
+              # try next port name
+            }
+          }
+          if (-not $installOk) { throw "Failed to install liblzma via vcpkg." }
 
       - name: Write xdelta build props
         shell: pwsh
         run: |
           $vcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } elseif ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
-          $includeDir = Join-Path $vcpkgRoot "installed\x64-windows\include"
-          $libDir = Join-Path $vcpkgRoot "installed\x64-windows\lib"
+          $triplet = if ($env:VCPKG_TRIPLET) { $env:VCPKG_TRIPLET } else { "x64-windows-static" }
+          $includeDir = Join-Path $vcpkgRoot "installed\$triplet\include"
+          $libDir = Join-Path $vcpkgRoot "installed\$triplet\lib"
           $propsPath = Join-Path $env:GITHUB_WORKSPACE "xdelta-build.props"
           $propsLines = @(
             '<Project>'
