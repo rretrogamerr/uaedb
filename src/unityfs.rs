@@ -196,36 +196,80 @@ impl UnityFsBundle {
                 .with_context(|| format!("Create output: {}", output_path.display()))?,
         );
 
-        for block in &self.blocks {
-            let comp_flag = (block.flags as u32) & COMP_MASK;
-            match comp_flag {
-                COMP_NONE => {
-                    copy_exact(&mut input, &mut output, block.compressed_size as u64)?;
-                }
-                COMP_LZ4 | COMP_LZ4HC => {
-                    let mut compressed = vec![0u8; block.compressed_size as usize];
-                    input.read_exact(&mut compressed)?;
-                    let data = lz4_decompress(&compressed, block.uncompressed_size as usize)
-                        .context("LZ4 decompress failed")?;
-                    output.write_all(&data)?;
-                }
-                COMP_LZMA => {
-                    if block.compressed_size < 5 {
-                        bail!("LZMA block too small to contain header");
-                    }
-                    let mut header = [0u8; 5];
-                    input.read_exact(&mut header)?;
-                    let remaining = (block.compressed_size - 5) as u64;
-                    let mut limited = input.by_ref().take(remaining);
-                    lzma_decompress_to_writer(&header, &mut limited, block.uncompressed_size as u64, &mut output)
-                        .context("LZMA decompress failed")?;
-                }
-                COMP_LZHAM => bail!("LZHAM compression is not supported."),
-                _ => bail!("Unknown compression flag: {}", comp_flag),
+        decompress_blocks_to_writer(&mut input, &mut output, &self.blocks)?;
+
+        output.flush()?;
+        Ok(())
+    }
+
+    pub fn unpack_to_file(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+        let mut input = BufReader::new(
+            File::open(input_path).with_context(|| format!("Open bundle: {}", input_path.display()))?,
+        );
+        input.seek(SeekFrom::Start(self.data_start))?;
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Create dir: {}", parent.display()))?;
+        }
+        let mut output = BufWriter::new(
+            File::create(output_path)
+                .with_context(|| format!("Create output: {}", output_path.display()))?,
+        );
+
+        let data_flags = (self.flags & !COMP_MASK) | FLAG_BLOCKS_AND_DIR;
+        let uncompressed_blocks: Vec<BlockInfo> = self
+            .blocks
+            .iter()
+            .map(|block| BlockInfo {
+                uncompressed_size: block.uncompressed_size,
+                compressed_size: block.uncompressed_size,
+                flags: clear_compression_flags(block.flags),
+            })
+            .collect();
+
+        let block_info_bytes = build_block_info_bytes(&uncompressed_blocks, &self.entries)?;
+        let block_info_size = block_info_bytes.len() as u32;
+
+        write_string_to_null(&mut output, &self.signature)?;
+        write_u32_be(&mut output, self.version)?;
+        write_string_to_null(&mut output, &self.version_player)?;
+        write_string_to_null(&mut output, &self.version_engine)?;
+
+        let size_offset = output.stream_position()?;
+        write_u64_be(&mut output, 0)?;
+        write_u32_be(&mut output, block_info_size)?;
+        write_u32_be(&mut output, block_info_size)?;
+        write_u32_be(&mut output, data_flags)?;
+
+        if self.uses_block_alignment {
+            align_writer(&mut output, 16)?;
+        }
+
+        let block_info_at_end = data_flags & FLAG_BLOCKS_INFO_AT_END != 0;
+        let block_info_need_padding = data_flags & FLAG_BLOCK_INFO_NEED_PADDING != 0;
+
+        if block_info_at_end {
+            if block_info_need_padding {
+                align_writer(&mut output, 16)?;
             }
+            decompress_blocks_to_writer(&mut input, &mut output, &self.blocks)?;
+            output.write_all(&block_info_bytes)?;
+        } else {
+            output.write_all(&block_info_bytes)?;
+            if block_info_need_padding {
+                align_writer(&mut output, 16)?;
+            }
+            decompress_blocks_to_writer(&mut input, &mut output, &self.blocks)?;
         }
 
         output.flush()?;
+        let mut file = output.into_inner()?;
+        let end_pos = file.stream_position()?;
+        file.seek(SeekFrom::Start(size_offset))?;
+        write_u64_be(&mut file, end_pos)?;
+        file.seek(SeekFrom::Start(end_pos))?;
+        file.flush()?;
         Ok(())
     }
 
@@ -416,7 +460,7 @@ fn build_block_info_bytes(blocks: &[BlockInfo], entries: &[DirectoryEntry]) -> R
 fn compress_block_info(data: &[u8], compression: u32) -> Result<Vec<u8>> {
     match compression {
         COMP_NONE => Ok(data.to_vec()),
-        COMP_LZ4 | COMP_LZ4HC => Ok(lz4_flex::block::compress(data)),
+        COMP_LZ4 | COMP_LZ4HC => lz4_compress(data),
         COMP_LZMA => compress_lzma_bytes(data),
         COMP_LZHAM => bail!("LZHAM compression is not supported."),
         _ => bail!("Unknown compression flag: {}", compression),
@@ -488,7 +532,7 @@ fn compress_data_blocks(
         let size = std::cmp::min(remaining as usize, chunk_size);
         let mut buf = vec![0u8; size];
         input.read_exact(&mut buf)?;
-        let compressed = lz4_flex::block::compress(&buf);
+        let compressed = lz4_compress(&buf)?;
         if compressed.len() > buf.len() {
             output.write_all(&buf)?;
             block_info.push(BlockInfo {
@@ -526,7 +570,18 @@ fn decompress_block_info(data: &[u8], uncompressed_size: usize, flags: u32) -> R
 }
 
 fn lz4_decompress(data: &[u8], size: usize) -> Result<Vec<u8>> {
-    lz4_flex::block::decompress(data, size).context("LZ4 decompress failed")
+    let size = i32::try_from(size).context("LZ4 size overflow")?;
+    lz4::block::decompress(data, Some(size)).context("LZ4 decompress failed")
+}
+
+fn lz4_compress(data: &[u8]) -> Result<Vec<u8>> {
+    // AssetsTools.NET Pack uses LZ4HC for bundle compression.
+    lz4::block::compress(
+        data,
+        Some(lz4::block::CompressionMode::HIGHCOMPRESSION(9)),
+        false,
+    )
+    .context("LZ4 compress failed")
 }
 
 fn lzma_decompress(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
@@ -563,8 +618,7 @@ fn lzma_decompress_to_writer<R: Read, W: Write>(
 }
 
 fn compress_lzma_bytes(data: &[u8]) -> Result<Vec<u8>> {
-    let options = xz2::stream::LzmaOptions::new_preset(6)
-        .context("Create LZMA encoder options")?;
+    let options = lzma_options_unity().context("Create LZMA encoder options")?;
     let stream = xz2::stream::Stream::new_lzma_encoder(&options)
         .context("Create LZMA encoder stream")?;
     let mut encoder = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
@@ -589,8 +643,7 @@ fn compress_lzma_file(input_path: &Path, output_path: &Path) -> Result<()> {
             File::create(&temp_path)
                 .with_context(|| format!("Create temp: {}", temp_path.display()))?,
         );
-        let options = xz2::stream::LzmaOptions::new_preset(6)
-            .context("Create LZMA encoder options")?;
+        let options = lzma_options_unity().context("Create LZMA encoder options")?;
         let stream = xz2::stream::Stream::new_lzma_encoder(&options)
             .context("Create LZMA encoder stream")?;
         let mut encoder = xz2::write::XzEncoder::new_stream(temp, stream);
@@ -613,6 +666,20 @@ fn compress_lzma_file(input_path: &Path, output_path: &Path) -> Result<()> {
     output.flush()?;
     std::fs::remove_file(&temp_path).ok();
     Ok(())
+}
+
+fn lzma_options_unity() -> Result<xz2::stream::LzmaOptions> {
+    // Match Unity/AssetsTools.NET LZMA1 defaults (as used by UABEA).
+    let mut options = xz2::stream::LzmaOptions::new_preset(6)?;
+    options
+        .dict_size(0x0080_0000)
+        .literal_context_bits(3)
+        .literal_position_bits(0)
+        .position_bits(2)
+        .mode(xz2::stream::Mode::Normal)
+        .match_finder(xz2::stream::MatchFinder::BinaryTree4)
+        .nice_len(123);
+    Ok(options)
 }
 
 fn copy_file(input_path: &Path, output_path: &Path) -> Result<()> {
@@ -643,6 +710,42 @@ fn copy_exact<R: Read, W: Write>(input: &mut R, output: &mut W, mut size: u64) -
         input.read_exact(&mut buffer[..read_size])?;
         output.write_all(&buffer[..read_size])?;
         size -= read_size as u64;
+    }
+    Ok(())
+}
+
+fn decompress_blocks_to_writer<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    blocks: &[BlockInfo],
+) -> Result<()> {
+    for block in blocks {
+        let comp_flag = (block.flags as u32) & COMP_MASK;
+        match comp_flag {
+            COMP_NONE => {
+                copy_exact(input, output, block.compressed_size as u64)?;
+            }
+            COMP_LZ4 | COMP_LZ4HC => {
+                let mut compressed = vec![0u8; block.compressed_size as usize];
+                input.read_exact(&mut compressed)?;
+                let data = lz4_decompress(&compressed, block.uncompressed_size as usize)
+                    .context("LZ4 decompress failed")?;
+                output.write_all(&data)?;
+            }
+            COMP_LZMA => {
+                if block.compressed_size < 5 {
+                    bail!("LZMA block too small to contain header");
+                }
+                let mut header = [0u8; 5];
+                input.read_exact(&mut header)?;
+                let remaining = (block.compressed_size - 5) as u64;
+                let mut limited = input.by_ref().take(remaining);
+                lzma_decompress_to_writer(&header, &mut limited, block.uncompressed_size as u64, output)
+                    .context("LZMA decompress failed")?;
+            }
+            COMP_LZHAM => bail!("LZHAM compression is not supported."),
+            _ => bail!("Unknown compression flag: {}", comp_flag),
+        }
     }
     Ok(())
 }

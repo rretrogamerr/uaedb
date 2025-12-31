@@ -23,7 +23,7 @@ struct Cli {
     patch: Option<PathBuf>,
     /// Output bundle path.
     output: Option<PathBuf>,
-    /// Write uncompressed bundle data to this path and exit.
+    /// Write an uncompressed UnityFS bundle to this path and exit.
     #[arg(long, value_name = "PATH")]
     uncompress: Option<PathBuf>,
     /// Entry path inside bundle to patch when multiple files are present.
@@ -128,7 +128,7 @@ fn uncompress_only(input: &Path, output: &Path) -> Result<()> {
 
     let bundle = UnityFsBundle::read(input)?;
     let decompress_start = log_step_start("Uncompressing bundle");
-    bundle.decompress_to_file(input, output)?;
+    bundle.unpack_to_file(input, output)?;
     log_step_done("Uncompress", decompress_start);
     Ok(())
 }

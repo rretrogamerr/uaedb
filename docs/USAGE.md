@@ -30,6 +30,8 @@ Uncompress only:
 uaedb original.unity3d --uncompress original.unity3d.uncompressed
 ```
 
+This outputs an uncompressed UnityFS bundle (matching UABEA's `.decomp` format).
+
 ## Notes
 
 - If you move `uaedb.exe`, also move the `runtime/` folder.

@@ -31,6 +31,8 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d --entry "data.unity
 uaedb original.unity3d --uncompress original.unity3d.uncompressed
 ```
 
+UABEA의 `.decomp`와 동일한 형식의 uncompressed UnityFS 번들을 출력합니다.
+
 ## 참고
 
 - `uaedb.exe`를 옮길 때는 `runtime/` 폴더도 함께 옮겨주세요.
