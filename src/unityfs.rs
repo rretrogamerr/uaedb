@@ -915,7 +915,7 @@ fn decompress_blocks_to_writer<R: Read, W: Write>(
         let comp_flag = (block.flags as u32) & COMP_MASK;
         match comp_flag {
             COMP_NONE => {
-                copy_exact(input, output, block.compressed_size as u64)?;
+                copy_exact(input, output, block.uncompressed_size as u64)?;
             }
             COMP_LZ4 | COMP_LZ4HC => {
                 let mut compressed = vec![0u8; block.compressed_size as usize];
