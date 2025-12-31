@@ -694,6 +694,15 @@ fn compress_data_blocks_with_layout(
                 });
             }
             COMP_LZ4 | COMP_LZ4HC => {
+                if size > i32::MAX as usize {
+                    output.write_all(&buf)?;
+                    block_info.push(BlockInfo {
+                        uncompressed_size: size as u32,
+                        compressed_size: size as u32,
+                        flags: clear_compression_flags(base_flags),
+                    });
+                    continue;
+                }
                 let compressed = lz4_compress(&buf)?;
                 if compressed.len() > buf.len() {
                     output.write_all(&buf)?;
