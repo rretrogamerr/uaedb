@@ -44,4 +44,5 @@ This outputs an uncompressed UnityFS bundle (matching UABEA's `.decomp` format).
 
 - If you move `uaedb.exe`, also move the `runtime/` folder.
 - If `xdelta3` is not found, pass `--xdelta` with the full path to `xdelta3.exe`.
-- Use `--keep-work` to inspect `entry.bin` and `bundle.data` inside the kept work directory.
+- Use `--keep-work` to inspect `entry.bin`, `entry_patched.bin`, `bundle_patched.data`,
+  or `bundle.uncompressed`, `bundle_patched.uncompressed`, `bundle.data` inside the kept work directory.

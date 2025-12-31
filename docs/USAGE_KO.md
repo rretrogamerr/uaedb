@@ -44,4 +44,6 @@ UABEA의 `.decomp`와 동일한 형식의 uncompressed UnityFS 번들을 출력�
 
 - `uaedb.exe`를 옮길 때는 `runtime/` 폴더도 함께 옮겨주세요.
 - `xdelta3`를 찾지 못하면 `--xdelta`로 `xdelta3.exe`의 전체 경로를 지정하세요.
-- `--keep-work` 옵션으로 보존된 작업 폴더 안의 `entry.bin`, `bundle.data`를 확인할 수 있습니다.
+- `--keep-work` 옵션으로 보존된 작업 폴더 안의 `entry.bin`, `entry_patched.bin`,
+  `bundle_patched.data` 또는 `bundle.uncompressed`, `bundle_patched.uncompressed`,
+  `bundle.data`를 확인할 수 있습니다.
