@@ -13,15 +13,23 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d
 ```
 
 `patch.xdelta` must be a file. Directories are rejected with an error.
-If a bundle contains multiple entries, pass `--entry` to select which file to
-patch (use `--list-entries` to see all paths). Without `--entry`, UAEDB tries
-each entry with the patch and requires exactly one match.
+By default UAEDB applies the patch to the full uncompressed bundle. Use
+`--entry` to patch a specific entry instead (use `--list-entries` to see
+all paths).
 
-List entries and select a target:
+List entries and select a target entry:
 
 ```bash
 uaedb original.unity3d patch.xdelta original_patched.unity3d --list-entries
 uaedb original.unity3d patch.xdelta original_patched.unity3d --entry "data.unity3d/GI/level84/..."
+```
+
+Create a patch from uncompressed bundles:
+
+```bash
+uaedb original.unity3d --uncompress original.unity3d.uncompressed
+uaedb modified.unity3d --uncompress modified.unity3d.uncompressed
+xdelta3 -e -s original.unity3d.uncompressed modified.unity3d.uncompressed patch.xdelta
 ```
 
 Uncompress only:

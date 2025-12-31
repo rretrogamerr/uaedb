@@ -19,14 +19,14 @@ use unityfs::{
 struct Cli {
     /// Input Unity asset bundle.
     input: PathBuf,
-    /// Patch file (.xdelta) for the uncompressed entry.
+    /// Patch file (.xdelta) for the uncompressed bundle.
     patch: Option<PathBuf>,
     /// Output bundle path.
     output: Option<PathBuf>,
     /// Write an uncompressed UnityFS bundle to this path and exit.
     #[arg(long, value_name = "PATH")]
     uncompress: Option<PathBuf>,
-    /// Entry path inside bundle to patch when multiple files are present.
+    /// Patch a specific entry instead of the full uncompressed bundle.
     #[arg(long)]
     entry: Option<String>,
     /// List bundle entries and exit.
@@ -183,27 +183,19 @@ fn apply_patch_path(
         temp.path().to_path_buf()
     };
 
-    let data_path = work_path.join("bundle.data");
-    let decompress_start = log_step_start("Uncompressing bundle");
-    bundle.decompress_to_file(input, &data_path)?;
-    log_step_done("Uncompress", decompress_start);
+    if let Some(entry) = entry {
+        let data_path = work_path.join("bundle.data");
+        let decompress_start = log_step_start("Uncompressing bundle data");
+        bundle.decompress_to_file(input, &data_path)?;
+        log_step_done("Uncompress", decompress_start);
 
-    let (entry_index, patched_path_opt) = if entry.is_none() && bundle.entries().len() > 1 {
-        auto_detect_entry(&bundle, &data_path, patch_path, &work_path, xdelta, keep_work)?
-    } else {
-        let (entry_index, _) = select_entry(bundle.entries(), entry)?;
-        (entry_index, None)
-    };
+        let (entry_index, _) = select_entry(bundle.entries(), Some(entry))?;
+        let entry_info = &bundle.entries()[entry_index];
+        eprintln!(
+            "Selected entry: {} ({} bytes)",
+            entry_info.path, entry_info.size
+        );
 
-    let entry_info = &bundle.entries()[entry_index];
-    eprintln!(
-        "Selected entry: {} ({} bytes)",
-        entry_info.path, entry_info.size
-    );
-
-    let patched_path = if let Some(path) = patched_path_opt {
-        path
-    } else {
         let entry_path = work_path.join("entry.bin");
         let extract_start = log_step_start("Extracting entry");
         bundle.extract_entry(&data_path, entry_index, &entry_path)?;
@@ -213,26 +205,58 @@ fn apply_patch_path(
         let patch_start = log_step_start("Applying xdelta patch");
         run_xdelta(xdelta, &entry_path, patch_path, &patched_path)?;
         log_step_done("Patch", patch_start);
-        patched_path
-    };
 
-    let rebuilt_data_path = work_path.join("bundle_patched.data");
-    let rebuild_start = log_step_start("Rebuilding bundle");
-    let new_entries = bundle.rebuild_data_file(
-        &data_path,
-        entry_index,
-        &patched_path,
-        &rebuilt_data_path,
-    )?;
+        let rebuilt_data_path = work_path.join("bundle_patched.data");
+        let rebuild_start = log_step_start("Rebuilding bundle");
+        let new_entries = bundle.rebuild_data_file(
+            &data_path,
+            entry_index,
+            &patched_path,
+            &rebuilt_data_path,
+        )?;
 
-    let (data_flags, block_info_flags) = apply_packer(
-        bundle.flags(),
-        bundle.block_info_flags(),
-        packer,
-    );
+        let (data_flags, block_info_flags) = apply_packer(
+            bundle.flags(),
+            bundle.block_info_flags(),
+            packer,
+        );
 
-    bundle.write_bundle(out, &rebuilt_data_path, &new_entries, data_flags, block_info_flags)?;
-    log_step_done("Rebuild", rebuild_start);
+        bundle.write_bundle(out, &rebuilt_data_path, &new_entries, data_flags, block_info_flags)?;
+        log_step_done("Rebuild", rebuild_start);
+    } else {
+        let uncompressed_path = work_path.join("bundle.uncompressed");
+        let unpack_start = log_step_start("Uncompressing bundle");
+        bundle.unpack_to_file(input, &uncompressed_path)?;
+        log_step_done("Uncompress", unpack_start);
+
+        let patched_bundle_path = work_path.join("bundle_patched.uncompressed");
+        let patch_start = log_step_start("Applying xdelta patch");
+        run_xdelta(xdelta, &uncompressed_path, patch_path, &patched_bundle_path)?;
+        log_step_done("Patch", patch_start);
+
+        let patched_bundle =
+            UnityFsBundle::read(&patched_bundle_path).context("Read patched bundle")?;
+        let data_path = work_path.join("bundle.data");
+        let extract_start = log_step_start("Extracting data");
+        patched_bundle.decompress_to_file(&patched_bundle_path, &data_path)?;
+        log_step_done("Extract", extract_start);
+
+        let (data_flags, block_info_flags) = apply_packer(
+            bundle.flags(),
+            bundle.block_info_flags(),
+            packer,
+        );
+
+        let rebuild_start = log_step_start("Rebuilding bundle");
+        patched_bundle.write_bundle(
+            out,
+            &data_path,
+            patched_bundle.entries(),
+            data_flags,
+            block_info_flags,
+        )?;
+        log_step_done("Rebuild", rebuild_start);
+    }
 
     if keep_work {
         eprintln!("Work directory kept at: {}", work_path.display());
@@ -329,59 +353,6 @@ fn print_entries(entries: &[DirectoryEntry]) {
     }
 }
 
-fn auto_detect_entry(
-    bundle: &UnityFsBundle,
-    data_path: &Path,
-    patch_path: &Path,
-    work_path: &Path,
-    xdelta: &Path,
-    keep_work: bool,
-) -> Result<(usize, Option<PathBuf>)> {
-    let detect_start = log_step_start("Auto-detecting patch target");
-    let entry_path = work_path.join("entry_candidate.bin");
-    let mut matches: Vec<(usize, String, PathBuf)> = Vec::new();
-
-    for (idx, entry) in bundle.entries().iter().enumerate() {
-        bundle.extract_entry(data_path, idx, &entry_path)?;
-        let patched_path = work_path.join(format!("entry_patched_{idx}.bin"));
-        let ok = try_xdelta(xdelta, &entry_path, patch_path, &patched_path)?;
-        if ok {
-            matches.push((idx, entry.path.clone(), patched_path));
-        } else {
-            fs::remove_file(&patched_path).ok();
-        }
-    }
-
-    log_step_done("Auto-detect", detect_start);
-
-    match matches.len() {
-        0 => bail!("Patch did not apply to any entry. Use --list-entries and --entry."),
-        1 => {
-            let (idx, path, patched_path) = matches.pop().unwrap();
-            eprintln!("Auto-detected entry: {}", path);
-            Ok((idx, Some(patched_path)))
-        }
-        _ => {
-            let preview = matches
-                .iter()
-                .take(5)
-                .map(|(_, path, _)| path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if !keep_work {
-                for (_, _, path) in &matches {
-                    fs::remove_file(path).ok();
-                }
-            }
-            bail!(
-                "Patch applied to multiple entries ({}). Use --entry. Matches: {}",
-                matches.len(),
-                preview
-            );
-        }
-    }
-}
-
 fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Result<()> {
     if output.exists() {
         fs::remove_file(output)
@@ -405,32 +376,6 @@ fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Resu
     }
 
     Ok(())
-}
-
-fn try_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Result<bool> {
-    if output.exists() {
-        fs::remove_file(output)
-            .with_context(|| format!("Remove existing file: {}", output.display()))?;
-    }
-
-    let status = Command::new(xdelta)
-        .arg("-d")
-        .arg("-s")
-        .arg(source)
-        .arg(patch)
-        .arg(output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("Run xdelta3 on {}", patch.display()))?;
-
-    if !status.success() {
-        fs::remove_file(output).ok();
-        return Ok(false);
-    }
-
-    Ok(true)
 }
 
 fn log_step_start(label: &str) -> Instant {

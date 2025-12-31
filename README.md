@@ -1,7 +1,7 @@
 # UAEDB
 
-UAEDB uncompresses Unity asset bundles, applies a `.xdelta` patch to the target
-file inside, then recompresses the bundle.
+UAEDB uncompresses Unity asset bundles, applies a `.xdelta` patch to the
+uncompressed bundle, then recompresses the bundle.
 
 ## Install (zip portable)
 
@@ -37,13 +37,15 @@ If a bundle contains multiple entries, pass `--entry` to select which file
 to patch (use `--list-entries` to see all paths). Without `--entry`, UAEDB
 tries each entry with the patch and requires exactly one match.
 
-Example patch creation:
+Example patch creation (uncompressed bundle):
 
 ```bash
-xdelta3 -e -s original_unpacked.unity3d modified_unpacked.unity3d patch.xdelta
+uaedb original.unity3d --uncompress original.unity3d.uncompressed
+uaedb modified.unity3d --uncompress modified.unity3d.uncompressed
+xdelta3 -e -s original.unity3d.uncompressed modified.unity3d.uncompressed patch.xdelta
 ```
 
-When a bundle expands into multiple files:
+Patch a specific entry instead of the full bundle:
 
 ```bash
 uaedb original.unity3d patch.xdelta original_patched.unity3d --list-entries
@@ -51,7 +53,8 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d --entry "data.unity
 ```
 
 Tip: run with `--keep-work` to inspect the extracted entry (`entry.bin`) and
-the uncompressed data stream (`bundle.data`) inside the kept work directory.
+the intermediate files (`bundle.uncompressed`, `bundle_patched.uncompressed`, `bundle.data`)
+inside the kept work directory.
 
 ### Uncompress only
 
