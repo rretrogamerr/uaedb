@@ -4,7 +4,7 @@
 
 1. Download the portable zip from the GitHub release.
 2. Extract the zip to any folder.
-3. Keep the `runtime/` and `scripts/` folders next to `uaedb.exe`.
+3. Keep the `runtime/` folder next to `uaedb.exe`.
 
 ## Usage
 
@@ -13,10 +13,18 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d
 ```
 
 `patch.xdelta` must be a file. Directories are rejected with an error.
-UAEDB expects the bundle to uncompress into a single file.
+If a bundle contains multiple entries, pass `--entry` to select which file to
+patch (use `--list-entries` to see all paths).
+
+List entries and select a target:
+
+```bash
+uaedb original.unity3d patch.xdelta original_patched.unity3d --list-entries
+uaedb original.unity3d patch.xdelta original_patched.unity3d --entry "data.unity3d/GI/level84/..."
+```
 
 ## Notes
 
-- If you move `uaedb.exe`, also move the `runtime/` and `scripts/` folders.
+- If you move `uaedb.exe`, also move the `runtime/` folder.
 - If `xdelta3` is not found, pass `--xdelta` with the full path to `xdelta3.exe`.
-- Use `--keep-work` to inspect the unpacked file under `workdir/unpack/files/`.
+- Use `--keep-work` to inspect `entry.bin` and `bundle.data` inside the kept work directory.

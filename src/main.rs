@@ -1,23 +1,34 @@
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
 use tempfile::Builder;
+
+mod unityfs;
+
+use unityfs::{
+    DirectoryEntry, UnityFsBundle, COMP_LZ4, COMP_LZMA, COMP_MASK, COMP_NONE,
+};
 
 #[derive(Parser)]
 #[command(name = "UAEDB", version, about = "Unity asset delta patcher")]
 struct Cli {
-    /// Input Unity asset bundle or serialized file.
+    /// Input Unity asset bundle.
     input: PathBuf,
-    /// Patch file (.xdelta) for the unpacked file.
+    /// Patch file (.xdelta) for the uncompressed entry.
     patch: PathBuf,
     /// Output bundle path.
     output: PathBuf,
+    /// Entry path inside bundle to patch when multiple files are present.
+    #[arg(long)]
+    entry: Option<String>,
+    /// List bundle entries and exit.
+    #[arg(long)]
+    list_entries: bool,
     /// Working directory for temporary files (default: current dir).
     #[arg(long)]
     work_dir: Option<PathBuf>,
@@ -27,15 +38,9 @@ struct Cli {
     /// Path to xdelta3 binary (default: runtime/xdelta/xdelta3 or xdelta3).
     #[arg(long)]
     xdelta: Option<PathBuf>,
-    /// Unity packer to use for bundles.
+    /// Bundle compression to use when writing output.
     #[arg(long, value_enum, default_value = "original")]
     packer: Packer,
-    /// Python interpreter to use (default: runtime/python/python or python).
-    #[arg(long)]
-    python: Option<PathBuf>,
-    /// UnityPy source path (optional). If set, passed as UNITYPY_PATH.
-    #[arg(long)]
-    unitypy: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -47,73 +52,31 @@ enum Packer {
 }
 
 impl Packer {
-    fn as_str(&self) -> &'static str {
+    fn override_compression(&self) -> Option<u32> {
         match self {
-            Packer::None => "none",
-            Packer::Lz4 => "lz4",
-            Packer::Lzma => "lzma",
-            Packer::Original => "original",
+            Packer::None => Some(COMP_NONE),
+            Packer::Lz4 => Some(COMP_LZ4),
+            Packer::Lzma => Some(COMP_LZMA),
+            Packer::Original => None,
         }
     }
 }
 
-#[derive(Deserialize)]
-struct Manifest {
-    version: u32,
-    entries: Vec<ManifestEntry>,
-}
-
-#[derive(Deserialize)]
-struct ManifestEntry {
-    disk_path: String,
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let python = cli.python.unwrap_or_else(default_python_path);
     let xdelta = cli.xdelta.unwrap_or_else(default_xdelta_path);
 
     apply_patch_path(
-        &python,
-        cli.unitypy.as_ref(),
         &xdelta,
         &cli.input,
         &cli.patch,
         &cli.output,
         cli.work_dir.as_ref(),
         cli.keep_work,
+        cli.entry.as_deref(),
+        cli.list_entries,
         cli.packer,
     )
-}
-
-fn script_path() -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(exe_dir) = exe_dir() {
-        candidates.push(exe_dir.join("scripts").join("uaedb_unitypy.py"));
-        candidates.push(exe_dir.join("uaedb_unitypy.py"));
-    }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join("uaedb_unitypy.py"),
-    );
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            return Ok(candidate.to_path_buf());
-        }
-    }
-
-    let joined = candidates
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if joined.is_empty() {
-        bail!("UnityPy helper script not found.");
-    }
-
-    bail!("UnityPy helper script not found. Tried: {}", joined);
 }
 
 fn exe_dir() -> Option<PathBuf> {
@@ -124,18 +87,6 @@ fn exe_dir() -> Option<PathBuf> {
 
 fn runtime_dir() -> Option<PathBuf> {
     exe_dir().map(|dir| dir.join("runtime"))
-}
-
-fn default_python_path() -> PathBuf {
-    if let Some(runtime) = runtime_dir() {
-        let exe_name = if cfg!(windows) { "python.exe" } else { "python" };
-        let candidate = runtime.join("python").join(exe_name);
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-
-    PathBuf::from("python")
 }
 
 fn default_xdelta_path() -> PathBuf {
@@ -154,124 +105,28 @@ fn default_xdelta_path() -> PathBuf {
     PathBuf::from("xdelta3")
 }
 
-fn runtime_pythonpath() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(runtime) = runtime_dir() {
-        let pydeps = runtime.join("pydeps");
-        if pydeps.exists() {
-            paths.push(pydeps);
-        }
-        let unitypy = runtime.join("unitypy");
-        if unitypy.exists() {
-            paths.push(unitypy);
-        }
-    }
-    paths
-}
-
-fn run_python(python: &Path, unitypy: Option<&PathBuf>, args: &[OsString]) -> Result<()> {
-    let mut command = Command::new(python);
-    if let Some(unitypy) = unitypy {
-        command.env("UNITYPY_PATH", unitypy);
-    }
-
-    let mut pythonpath_entries = runtime_pythonpath();
-    if let Some(existing) = env::var_os("PYTHONPATH") {
-        pythonpath_entries.extend(env::split_paths(&existing));
-    }
-    if !pythonpath_entries.is_empty() {
-        let joined = env::join_paths(pythonpath_entries.iter())
-            .context("Join PYTHONPATH for UnityPy runtime")?;
-        command.env("PYTHONPATH", joined);
-        command.env("PYTHONNOUSERSITE", "1");
-    }
-
-    let output = command.args(args).output().with_context(|| {
-        format!(
-            "Failed to run python: {} {}",
-            python.display(),
-            args.iter()
-                .map(|s| s.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "Python helper failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            stdout,
-            stderr
-        );
-    }
-
-    Ok(())
-}
-
-fn unpack_bundle(python: &Path, unitypy: Option<&PathBuf>, input: &Path, out: &Path) -> Result<()> {
-    fs::create_dir_all(out).with_context(|| format!("Create output dir: {}", out.display()))?;
-    let files_dir = out.join("files");
-    fs::create_dir_all(&files_dir)
-        .with_context(|| format!("Create files dir: {}", files_dir.display()))?;
-    let manifest = out.join("manifest.json");
-
-    let script = script_path()?;
-    let args = vec![
-        script.into_os_string(),
-        OsString::from("unpack"),
-        OsString::from("--input"),
-        input.as_os_str().to_os_string(),
-        OsString::from("--files"),
-        files_dir.as_os_str().to_os_string(),
-        OsString::from("--manifest"),
-        manifest.as_os_str().to_os_string(),
-    ];
-
-    run_python(python, unitypy, &args)
-}
-
-fn repack_bundle(
-    python: &Path,
-    unitypy: Option<&PathBuf>,
-    input: &Path,
-    files: &Path,
-    manifest: &Path,
-    out: &Path,
-    packer: Packer,
-) -> Result<()> {
-    let script = script_path()?;
-    let args = vec![
-        script.into_os_string(),
-        OsString::from("repack"),
-        OsString::from("--input"),
-        input.as_os_str().to_os_string(),
-        OsString::from("--files"),
-        files.as_os_str().to_os_string(),
-        OsString::from("--manifest"),
-        manifest.as_os_str().to_os_string(),
-        OsString::from("--output"),
-        out.as_os_str().to_os_string(),
-        OsString::from("--packer"),
-        OsString::from(packer.as_str()),
-    ];
-
-    run_python(python, unitypy, &args)
-}
-
 fn apply_patch_path(
-    python: &Path,
-    unitypy: Option<&PathBuf>,
     xdelta: &Path,
     input: &Path,
     patch_path: &Path,
     out: &Path,
     work_dir: Option<&PathBuf>,
     keep_work: bool,
+    entry: Option<&str>,
+    list_entries: bool,
     packer: Packer,
 ) -> Result<()> {
+    if !input.is_file() {
+        bail!("Input bundle not found: {}", input.display());
+    }
+
+    let bundle = UnityFsBundle::read(input)?;
+
+    if list_entries {
+        print_entries(bundle.entries());
+        return Ok(());
+    }
+
     if !patch_path.is_file() {
         if patch_path.is_dir() {
             bail!(
@@ -281,6 +136,12 @@ fn apply_patch_path(
         }
         bail!("Patch path not found: {}", patch_path.display());
     }
+
+    let (entry_index, entry_info) = select_entry(bundle.entries(), entry)?;
+    eprintln!(
+        "Selected entry: {} ({} bytes)",
+        entry_info.path, entry_info.size
+    );
 
     let work_root = match work_dir {
         Some(path) => path.clone(),
@@ -300,57 +161,38 @@ fn apply_patch_path(
         temp.path().to_path_buf()
     };
 
-    let unpack_dir = work_path.join("unpack");
-    let files_dir = unpack_dir.join("files");
-    let manifest_path = unpack_dir.join("manifest.json");
-    unpack_bundle(python, unitypy, input, &unpack_dir)?;
+    let data_path = work_path.join("bundle.data");
+    let decompress_start = log_step_start("Uncompressing bundle");
+    bundle.decompress_to_file(input, &data_path)?;
+    log_step_done("Uncompress", decompress_start);
 
-    let manifest = read_manifest(&manifest_path)?;
-    if manifest.entries.len() != 1 {
-        let preview = manifest
-            .entries
-            .iter()
-            .take(5)
-            .map(|entry| entry.disk_path.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "Expected exactly 1 unpacked file, found {}. Entries: {}",
-            manifest.entries.len(),
-            preview
-        );
-    }
+    let entry_path = work_path.join("entry.bin");
+    let extract_start = log_step_start("Extracting entry");
+    bundle.extract_entry(&data_path, entry_index, &entry_path)?;
+    log_step_done("Extract", extract_start);
 
-    let entry = &manifest.entries[0];
-    let src_path = files_dir.join(&entry.disk_path);
-    if !src_path.exists() {
-        bail!(
-            "Unpacked file not found: {}",
-            src_path.display()
-        );
-    }
+    let patched_path = work_path.join("entry_patched.bin");
+    let patch_start = log_step_start("Applying xdelta patch");
+    run_xdelta(xdelta, &entry_path, patch_path, &patched_path)?;
+    log_step_done("Patch", patch_start);
 
-    let patched_dir = work_path.join("patched");
-    fs::create_dir_all(&patched_dir)
-        .with_context(|| format!("Create patched dir: {}", patched_dir.display()))?;
-
-    let dst_path = patched_dir.join(&entry.disk_path);
-    if let Some(parent) = dst_path.parent() {
-        fs::create_dir_all(parent.to_path_buf())
-            .with_context(|| format!("Create dir: {}", parent.display()))?;
-    }
-
-    run_xdelta(xdelta, &src_path, patch_path, &dst_path)?;
-
-    repack_bundle(
-        python,
-        unitypy,
-        input,
-        &patched_dir,
-        &manifest_path,
-        out,
-        packer,
+    let rebuilt_data_path = work_path.join("bundle_patched.data");
+    let rebuild_start = log_step_start("Rebuilding bundle");
+    let new_entries = bundle.rebuild_data_file(
+        &data_path,
+        entry_index,
+        &patched_path,
+        &rebuilt_data_path,
     )?;
+
+    let (data_flags, block_info_flags) = apply_packer(
+        bundle.flags(),
+        bundle.block_info_flags(),
+        packer,
+    );
+
+    bundle.write_bundle(out, &rebuilt_data_path, &new_entries, data_flags, block_info_flags)?;
+    log_step_done("Rebuild", rebuild_start);
 
     if keep_work {
         eprintln!("Work directory kept at: {}", work_path.display());
@@ -359,15 +201,92 @@ fn apply_patch_path(
     Ok(())
 }
 
-fn read_manifest(path: &Path) -> Result<Manifest> {
-    let data = fs::read_to_string(path)
-        .with_context(|| format!("Read manifest: {}", path.display()))?;
-    let manifest: Manifest = serde_json::from_str(&data)
-        .with_context(|| format!("Parse manifest: {}", path.display()))?;
-    if manifest.version != 1 {
-        bail!("Unsupported manifest version: {}", manifest.version);
+fn apply_packer(flags: u32, block_info_flags: u16, packer: Packer) -> (u32, u16) {
+    let Some(compression) = packer.override_compression() else {
+        return (flags, block_info_flags);
+    };
+
+    let new_flags = (flags & !COMP_MASK) | compression;
+    let new_block_info_flags = (block_info_flags & !(COMP_MASK as u16)) | (compression as u16);
+
+    (new_flags, new_block_info_flags)
+}
+
+fn normalize_entry_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_lowercase()
+    } else {
+        normalized
     }
-    Ok(manifest)
+}
+
+fn select_entry<'a>(
+    entries: &'a [DirectoryEntry],
+    entry: Option<&str>,
+) -> Result<(usize, &'a DirectoryEntry)> {
+    if entries.is_empty() {
+        bail!("Bundle contains no entries");
+    }
+
+    if let Some(entry) = entry {
+        let target = normalize_entry_path(entry);
+        let exact_matches: Vec<(usize, &DirectoryEntry)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| normalize_entry_path(&item.path) == target)
+            .collect();
+        if exact_matches.len() == 1 {
+            return Ok(exact_matches[0]);
+        }
+        if exact_matches.len() > 1 {
+            bail!(
+                "Entry matches multiple files: {} ({} matches). Use --list-entries.",
+                entry,
+                exact_matches.len()
+            );
+        }
+
+        let suffix_matches: Vec<(usize, &DirectoryEntry)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| normalize_entry_path(&item.path).ends_with(&target))
+            .collect();
+        if suffix_matches.len() == 1 {
+            return Ok(suffix_matches[0]);
+        }
+        if suffix_matches.len() > 1 {
+            bail!(
+                "Entry matches multiple files by suffix: {} ({} matches). Use --list-entries.",
+                entry,
+                suffix_matches.len()
+            );
+        }
+
+        bail!("Entry not found: {}. Use --list-entries.", entry);
+    }
+
+    if entries.len() == 1 {
+        return Ok((0, &entries[0]));
+    }
+
+    let preview = entries
+        .iter()
+        .take(5)
+        .map(|item| item.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "Expected exactly 1 bundle entry, found {}. Use --entry or --list-entries. Entries: {}",
+        entries.len(),
+        preview
+    );
+}
+
+fn print_entries(entries: &[DirectoryEntry]) {
+    for item in entries {
+        println!("{}\t{}", item.size, item.path);
+    }
 }
 
 fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Result<()> {
@@ -376,25 +295,30 @@ fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Resu
             .with_context(|| format!("Remove existing file: {}", output.display()))?;
     }
 
-    let output = Command::new(xdelta)
+    let status = Command::new(xdelta)
         .arg("-d")
         .arg("-s")
         .arg(source)
         .arg(patch)
         .arg(output)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
         .with_context(|| format!("Run xdelta3 on {}", patch.display()))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "xdelta failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            stdout,
-            stderr
-        );
+    if !status.success() {
+        bail!("xdelta failed (exit {}). See output above.", status);
     }
 
     Ok(())
+}
+
+fn log_step_start(label: &str) -> Instant {
+    eprintln!("{label}...");
+    Instant::now()
+}
+
+fn log_step_done(label: &str, start: Instant) {
+    eprintln!("{label} done in {:.1}s", start.elapsed().as_secs_f64());
 }
