@@ -1,6 +1,7 @@
 param(
     [string]$OutputDir = "dist\\uaedb-portable",
     [string]$Python = "python",
+    [string]$PythonRuntime = "",
     [string]$UnityPyPath = "",
     [string]$XdeltaPath = ""
 )
@@ -62,6 +63,19 @@ Copy-Item "$root\\docs\\USAGE_KO.md" "$OutputDir\\docs\\USAGE_KO.md"
 
 Write-Host "Installing UnityPy dependencies into runtime\\pydeps..."
 & $Python -m pip install --upgrade --target "$OutputDir\\runtime\\pydeps" "$UnityPyPath"
+
+if (-not $PythonRuntime -and $env:pythonLocation) {
+    $PythonRuntime = $env:pythonLocation
+}
+if ($PythonRuntime) {
+    Write-Host "Bundling Python runtime from: $PythonRuntime"
+    $runtimePython = Join-Path $OutputDir "runtime\\python"
+    if (Test-Path $runtimePython) {
+        Remove-Item $runtimePython -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $runtimePython | Out-Null
+    Copy-Item -Path (Join-Path $PythonRuntime "*") -Destination $runtimePython -Recurse -Force
+}
 
 Write-Host "Copying xdelta3.exe..."
 Copy-Item "$XdeltaPath" "$OutputDir\\runtime\\xdelta\\xdelta3.exe"
