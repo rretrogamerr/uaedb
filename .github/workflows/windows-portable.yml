@@ -55,8 +55,7 @@ jobs:
         working-directory: xdelta/xdelta3
         shell: pwsh
         run: |
-          $env:CL = "/D SIZEOF_SIZE_T=8 /D SIZEOF_UNSIGNED_LONG_LONG=8"
-          msbuild xdelta3.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+          msbuild xdelta3.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:PreprocessorDefinitions='%(PreprocessorDefinitions);SIZEOF_SIZE_T=8;SIZEOF_UNSIGNED_LONG_LONG=8;SECONDARY_LZMA=0;XD3_USE_LZMA=0'
 
       - name: Locate xdelta3.exe
         shell: pwsh
