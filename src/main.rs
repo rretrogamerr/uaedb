@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -235,6 +237,9 @@ fn apply_patch_path(
         bundle.unpack_to_file(input, &uncompressed_path)?;
         log_step_done("Uncompress", unpack_start);
 
+        let uncompressed_bundle =
+            UnityFsBundle::read(&uncompressed_path).context("Read uncompressed bundle")?;
+
         let patched_bundle_path = work_path.join("bundle_patched.uncompressed");
         let patch_start = log_step_start("Applying xdelta patch");
         run_xdelta(xdelta, &uncompressed_path, patch_path, &patched_bundle_path)?;
@@ -244,7 +249,43 @@ fn apply_patch_path(
             UnityFsBundle::read(&patched_bundle_path).context("Read patched bundle")?;
         let data_path = work_path.join("bundle.data");
         let extract_start = log_step_start("Extracting data");
-        patched_bundle.decompress_to_file(&patched_bundle_path, &data_path)?;
+        let max_entry_end = patched_bundle
+            .entries()
+            .iter()
+            .map(|entry| entry.offset + entry.size)
+            .max()
+            .unwrap_or(0);
+        let block_total: u64 = patched_bundle
+            .blocks()
+            .iter()
+            .map(|block| block.uncompressed_size as u64)
+            .sum();
+        let use_raw_data = block_total < max_entry_end;
+        let mut data_len = None;
+        if use_raw_data {
+            eprintln!(
+                "Warning: patched block info covers {} bytes but entries require {}. Using raw data region.",
+                block_total, max_entry_end
+            );
+            let file_len = fs::metadata(&patched_bundle_path)
+                .with_context(|| format!("Stat bundle: {}", patched_bundle_path.display()))?
+                .len();
+            let start = patched_bundle.data_start();
+            let len = file_len
+                .checked_sub(start)
+                .context("Patched bundle shorter than data offset")?;
+            if len < max_entry_end {
+                bail!(
+                    "Patched data length {} is smaller than max entry end {}",
+                    len,
+                    max_entry_end
+                );
+            }
+            extract_raw_data(&patched_bundle_path, start, len, &data_path)?;
+            data_len = Some(len);
+        } else {
+            patched_bundle.decompress_to_file(&patched_bundle_path, &data_path)?;
+        }
         log_step_done("Extract", extract_start);
 
         let (data_flags, block_info_flags) = apply_packer(
@@ -254,14 +295,41 @@ fn apply_patch_path(
         );
 
         let rebuild_start = log_step_start("Rebuilding bundle");
-        patched_bundle.write_bundle_with_layout(
-            out,
-            &data_path,
-            patched_bundle.entries(),
-            data_flags,
-            block_info_flags,
-            patched_bundle.blocks(),
-        )?;
+        if use_raw_data {
+            let layout_total: u64 = uncompressed_bundle
+                .blocks()
+                .iter()
+                .map(|block| block.uncompressed_size as u64)
+                .sum();
+            let data_len = data_len.unwrap_or(layout_total);
+            if data_len == layout_total {
+                patched_bundle.write_bundle_with_layout(
+                    out,
+                    &data_path,
+                    patched_bundle.entries(),
+                    data_flags,
+                    block_info_flags,
+                    uncompressed_bundle.blocks(),
+                )?;
+            } else {
+                patched_bundle.write_bundle(
+                    out,
+                    &data_path,
+                    patched_bundle.entries(),
+                    data_flags,
+                    block_info_flags,
+                )?;
+            }
+        } else {
+            patched_bundle.write_bundle_with_layout(
+                out,
+                &data_path,
+                patched_bundle.entries(),
+                data_flags,
+                block_info_flags,
+                patched_bundle.blocks(),
+            )?;
+        }
         log_step_done("Rebuild", rebuild_start);
     }
 
@@ -281,6 +349,25 @@ fn apply_packer(flags: u32, block_info_flags: u16, packer: Packer) -> (u32, u16)
     let new_block_info_flags = (block_info_flags & !(COMP_MASK as u16)) | (compression as u16);
 
     (new_flags, new_block_info_flags)
+}
+
+fn extract_raw_data(input_path: &Path, start: u64, len: u64, output_path: &Path) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Create dir: {}", parent.display()))?;
+    }
+    let mut input = BufReader::new(
+        File::open(input_path).with_context(|| format!("Open bundle: {}", input_path.display()))?,
+    );
+    input.seek(SeekFrom::Start(start))?;
+    let mut output = BufWriter::new(
+        File::create(output_path)
+            .with_context(|| format!("Create output: {}", output_path.display()))?,
+    );
+    let mut limited = input.take(len);
+    io::copy(&mut limited, &mut output)?;
+    output.flush()?;
+    Ok(())
 }
 
 fn normalize_entry_path(path: &str) -> String {

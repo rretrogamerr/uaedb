@@ -185,6 +185,10 @@ impl UnityFsBundle {
         self.block_info_flags
     }
 
+    pub fn data_start(&self) -> u64 {
+        self.data_start
+    }
+
     pub fn decompress_to_file(&self, input_path: &Path, output_path: &Path) -> Result<()> {
         let mut input = BufReader::new(
             File::open(input_path).with_context(|| format!("Open bundle: {}", input_path.display()))?,
