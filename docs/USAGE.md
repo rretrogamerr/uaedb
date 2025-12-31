@@ -24,6 +24,12 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d --list-entries
 uaedb original.unity3d patch.xdelta original_patched.unity3d --entry "data.unity3d/GI/level84/..."
 ```
 
+Uncompress only:
+
+```bash
+uaedb original.unity3d --uncompress original.unity3d.uncompressed
+```
+
 ## Notes
 
 - If you move `uaedb.exe`, also move the `runtime/` folder.

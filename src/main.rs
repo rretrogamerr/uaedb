@@ -20,9 +20,12 @@ struct Cli {
     /// Input Unity asset bundle.
     input: PathBuf,
     /// Patch file (.xdelta) for the uncompressed entry.
-    patch: PathBuf,
+    patch: Option<PathBuf>,
     /// Output bundle path.
-    output: PathBuf,
+    output: Option<PathBuf>,
+    /// Write uncompressed bundle data to this path and exit.
+    #[arg(long, value_name = "PATH")]
+    uncompress: Option<PathBuf>,
     /// Entry path inside bundle to patch when multiple files are present.
     #[arg(long)]
     entry: Option<String>,
@@ -66,11 +69,24 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let xdelta = cli.xdelta.unwrap_or_else(default_xdelta_path);
 
+    if let Some(out) = cli.uncompress.as_ref() {
+        return uncompress_only(&cli.input, out);
+    }
+
+    let patch = cli
+        .patch
+        .as_ref()
+        .context("Missing patch path. Provide PATCH or use --uncompress.")?;
+    let output = cli
+        .output
+        .as_ref()
+        .context("Missing output path. Provide OUTPUT or use --uncompress.")?;
+
     apply_patch_path(
         &xdelta,
         &cli.input,
-        &cli.patch,
-        &cli.output,
+        patch,
+        output,
         cli.work_dir.as_ref(),
         cli.keep_work,
         cli.entry.as_deref(),
@@ -103,6 +119,18 @@ fn default_xdelta_path() -> PathBuf {
     }
 
     PathBuf::from("xdelta3")
+}
+
+fn uncompress_only(input: &Path, output: &Path) -> Result<()> {
+    if !input.is_file() {
+        bail!("Input bundle not found: {}", input.display());
+    }
+
+    let bundle = UnityFsBundle::read(input)?;
+    let decompress_start = log_step_start("Uncompressing bundle");
+    bundle.decompress_to_file(input, output)?;
+    log_step_done("Uncompress", decompress_start);
+    Ok(())
 }
 
 fn apply_patch_path(

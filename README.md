@@ -53,6 +53,12 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d --entry "data.unity
 Tip: run with `--keep-work` to inspect the extracted entry (`entry.bin`) and
 the uncompressed bundle data (`bundle.data`) inside the kept work directory.
 
+### Uncompress only
+
+```bash
+uaedb original.unity3d --uncompress original.unity3d.uncompressed
+```
+
 ## Troubleshooting
 
 - If you move `uaedb.exe`, also move the `runtime/` folder with it.

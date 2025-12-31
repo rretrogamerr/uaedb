@@ -25,6 +25,12 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d --list-entries
 uaedb original.unity3d patch.xdelta original_patched.unity3d --entry "data.unity3d/GI/level84/..."
 ```
 
+언컴프레스만 할 때:
+
+```bash
+uaedb original.unity3d --uncompress original.unity3d.uncompressed
+```
+
 ## 참고
 
 - `uaedb.exe`를 옮길 때는 `runtime/` 폴더도 함께 옮겨주세요.
