@@ -173,6 +173,10 @@ impl UnityFsBundle {
         &self.entries
     }
 
+    pub fn blocks(&self) -> &[BlockInfo] {
+        &self.blocks
+    }
+
     pub fn flags(&self) -> u32 {
         self.flags
     }
@@ -436,6 +440,93 @@ impl UnityFsBundle {
         std::fs::remove_file(&compressed_data_path).ok();
         Ok(())
     }
+
+    pub fn write_bundle_with_layout(
+        &self,
+        output_path: &Path,
+        data_path: &Path,
+        entries: &[DirectoryEntry],
+        data_flags: u32,
+        block_layout: &[BlockInfo],
+    ) -> Result<()> {
+        let compression = data_flags & COMP_MASK;
+        if compression == COMP_LZHAM {
+            bail!("LZHAM compression is not supported.");
+        }
+        if data_flags & FLAG_BLOCKS_AND_DIR == 0 {
+            bail!("Bundle flags must include BlocksAndDirectoryInfoCombined (0x40).");
+        }
+        if block_layout.is_empty() {
+            bail!("Bundle has no blocks.");
+        }
+
+        let block_info_at_end = data_flags & FLAG_BLOCKS_INFO_AT_END != 0;
+        let block_info_need_padding = data_flags & FLAG_BLOCK_INFO_NEED_PADDING != 0;
+
+        let work_dir = output_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let compressed_data_path = work_dir.join("uaedb-data.compressed");
+
+        let block_info = compress_data_blocks_with_layout(
+            data_path,
+            &compressed_data_path,
+            block_layout,
+            compression,
+        )?;
+
+        let block_info_bytes = build_block_info_bytes(&block_info, entries)?;
+        let uncompressed_block_info_size = block_info_bytes.len() as u32;
+        let compressed_block_info_bytes =
+            compress_block_info(&block_info_bytes, compression)?;
+        let compressed_block_info_size = compressed_block_info_bytes.len() as u32;
+
+        let mut output = BufWriter::new(
+            File::create(output_path)
+                .with_context(|| format!("Create bundle: {}", output_path.display()))?,
+        );
+
+        write_string_to_null(&mut output, &self.signature)?;
+        write_u32_be(&mut output, self.version)?;
+        write_string_to_null(&mut output, &self.version_player)?;
+        write_string_to_null(&mut output, &self.version_engine)?;
+
+        let size_offset = output.stream_position()?;
+        write_u64_be(&mut output, 0)?;
+        write_u32_be(&mut output, compressed_block_info_size)?;
+        write_u32_be(&mut output, uncompressed_block_info_size)?;
+        write_u32_be(&mut output, data_flags)?;
+
+        if self.uses_block_alignment {
+            align_writer(&mut output, 16)?;
+        }
+
+        if block_info_at_end {
+            if block_info_need_padding {
+                align_writer(&mut output, 16)?;
+            }
+            copy_file_to_writer(&compressed_data_path, &mut output)?;
+            output.write_all(&compressed_block_info_bytes)?;
+        } else {
+            output.write_all(&compressed_block_info_bytes)?;
+            if block_info_need_padding {
+                align_writer(&mut output, 16)?;
+            }
+            copy_file_to_writer(&compressed_data_path, &mut output)?;
+        }
+
+        output.flush()?;
+        let mut file = output.into_inner()?;
+        let end_pos = file.stream_position()?;
+        file.seek(SeekFrom::Start(size_offset))?;
+        write_u64_be(&mut file, end_pos)?;
+        file.seek(SeekFrom::Start(end_pos))?;
+        file.flush()?;
+
+        std::fs::remove_file(&compressed_data_path).ok();
+        Ok(())
+    }
 }
 
 fn build_block_info_bytes(blocks: &[BlockInfo], entries: &[DirectoryEntry]) -> Result<Vec<u8>> {
@@ -551,6 +642,96 @@ fn compress_data_blocks(
         remaining = remaining
             .checked_sub(size as u64)
             .context("Chunk size overflow")?;
+    }
+
+    output.flush()?;
+    Ok(block_info)
+}
+
+fn compress_data_blocks_with_layout(
+    data_path: &Path,
+    output_path: &Path,
+    layout: &[BlockInfo],
+    compression: u32,
+) -> Result<Vec<BlockInfo>> {
+    let data_len = std::fs::metadata(data_path)
+        .with_context(|| format!("Stat data: {}", data_path.display()))?
+        .len();
+    let expected_len: u64 = layout
+        .iter()
+        .map(|block| block.uncompressed_size as u64)
+        .sum();
+    if data_len != expected_len {
+        bail!(
+            "Data length mismatch (expected {}, got {})",
+            expected_len,
+            data_len
+        );
+    }
+
+    let mut input = BufReader::new(
+        File::open(data_path).with_context(|| format!("Open data: {}", data_path.display()))?,
+    );
+    let mut output = BufWriter::new(
+        File::create(output_path)
+            .with_context(|| format!("Create compressed data: {}", output_path.display()))?,
+    );
+
+    let mut block_info = Vec::with_capacity(layout.len());
+
+    for block in layout {
+        let size = block.uncompressed_size as usize;
+        let mut buf = vec![0u8; size];
+        input.read_exact(&mut buf)?;
+        let base_flags = (block.flags & !(COMP_MASK as u16)) | (compression as u16);
+        match compression {
+            COMP_NONE => {
+                output.write_all(&buf)?;
+                block_info.push(BlockInfo {
+                    uncompressed_size: size as u32,
+                    compressed_size: size as u32,
+                    flags: clear_compression_flags(base_flags),
+                });
+            }
+            COMP_LZ4 | COMP_LZ4HC => {
+                let compressed = lz4_compress(&buf)?;
+                if compressed.len() > buf.len() {
+                    output.write_all(&buf)?;
+                    block_info.push(BlockInfo {
+                        uncompressed_size: size as u32,
+                        compressed_size: size as u32,
+                        flags: clear_compression_flags(base_flags),
+                    });
+                } else {
+                    output.write_all(&compressed)?;
+                    block_info.push(BlockInfo {
+                        uncompressed_size: size as u32,
+                        compressed_size: compressed.len() as u32,
+                        flags: base_flags,
+                    });
+                }
+            }
+            COMP_LZMA => {
+                let compressed = compress_lzma_bytes(&buf)?;
+                if compressed.len() >= buf.len() {
+                    output.write_all(&buf)?;
+                    block_info.push(BlockInfo {
+                        uncompressed_size: size as u32,
+                        compressed_size: size as u32,
+                        flags: clear_compression_flags(base_flags),
+                    });
+                } else {
+                    output.write_all(&compressed)?;
+                    block_info.push(BlockInfo {
+                        uncompressed_size: size as u32,
+                        compressed_size: compressed.len() as u32,
+                        flags: base_flags,
+                    });
+                }
+            }
+            COMP_LZHAM => bail!("LZHAM compression is not supported."),
+            _ => bail!("Unsupported compression flag: {}", compression),
+        }
     }
 
     output.flush()?;

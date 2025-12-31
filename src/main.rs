@@ -221,7 +221,13 @@ fn apply_patch_path(
             packer,
         );
 
-        bundle.write_bundle(out, &rebuilt_data_path, &new_entries, data_flags, block_info_flags)?;
+        bundle.write_bundle(
+            out,
+            &rebuilt_data_path,
+            &new_entries,
+            data_flags,
+            block_info_flags,
+        )?;
         log_step_done("Rebuild", rebuild_start);
     } else {
         let uncompressed_path = work_path.join("bundle.uncompressed");
@@ -241,19 +247,19 @@ fn apply_patch_path(
         patched_bundle.decompress_to_file(&patched_bundle_path, &data_path)?;
         log_step_done("Extract", extract_start);
 
-        let (data_flags, block_info_flags) = apply_packer(
+        let (data_flags, _) = apply_packer(
             bundle.flags(),
             bundle.block_info_flags(),
             packer,
         );
 
         let rebuild_start = log_step_start("Rebuilding bundle");
-        patched_bundle.write_bundle(
+        patched_bundle.write_bundle_with_layout(
             out,
             &data_path,
             patched_bundle.entries(),
             data_flags,
-            block_info_flags,
+            patched_bundle.blocks(),
         )?;
         log_step_done("Rebuild", rebuild_start);
     }
