@@ -110,9 +110,13 @@ jobs:
           )
           $sourceLib = $candidateLibs | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $sourceLib) { throw "liblzma not found in $libDir" }
-          $destDir = Join-Path $env:GITHUB_WORKSPACE "xdelta\\src\\xz\\bin_x86-64"
-          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-          Copy-Item $sourceLib (Join-Path $destDir "liblzma_static.lib") -Force
+          $projectDir = Join-Path $env:GITHUB_WORKSPACE "xdelta\\xdelta3"
+          $expectedLibDir = [IO.Path]::GetFullPath((Join-Path $projectDir "..\\..\\..\\..\\src\\xz\\bin_x86-64"))
+          $repoLibDir = Join-Path $env:GITHUB_WORKSPACE "xdelta\\src\\xz\\bin_x86-64"
+          foreach ($destDir in @($expectedLibDir, $repoLibDir)) {
+            New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+            Copy-Item $sourceLib (Join-Path $destDir "liblzma_static.lib") -Force
+          }
 
       - name: Build xdelta3
         working-directory: xdelta/xdelta3
