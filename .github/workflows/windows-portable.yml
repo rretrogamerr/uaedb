@@ -53,7 +53,7 @@ jobs:
 
       - name: Build xdelta3
         working-directory: xdelta/xdelta3
-        run: msbuild xdelta3.vcxproj /p:Configuration=Release /p:Platform=x64
+        run: msbuild xdelta3.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
 
       - name: Locate xdelta3.exe
         shell: pwsh
