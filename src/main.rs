@@ -137,12 +137,6 @@ fn apply_patch_path(
         bail!("Patch path not found: {}", patch_path.display());
     }
 
-    let (entry_index, entry_info) = select_entry(bundle.entries(), entry)?;
-    eprintln!(
-        "Selected entry: {} ({} bytes)",
-        entry_info.path, entry_info.size
-    );
-
     let work_root = match work_dir {
         Some(path) => path.clone(),
         None => std::env::current_dir().context("Get current dir")?,
@@ -166,15 +160,33 @@ fn apply_patch_path(
     bundle.decompress_to_file(input, &data_path)?;
     log_step_done("Uncompress", decompress_start);
 
-    let entry_path = work_path.join("entry.bin");
-    let extract_start = log_step_start("Extracting entry");
-    bundle.extract_entry(&data_path, entry_index, &entry_path)?;
-    log_step_done("Extract", extract_start);
+    let (entry_index, patched_path_opt) = if entry.is_none() && bundle.entries().len() > 1 {
+        auto_detect_entry(&bundle, &data_path, patch_path, &work_path, xdelta, keep_work)?
+    } else {
+        let (entry_index, _) = select_entry(bundle.entries(), entry)?;
+        (entry_index, None)
+    };
 
-    let patched_path = work_path.join("entry_patched.bin");
-    let patch_start = log_step_start("Applying xdelta patch");
-    run_xdelta(xdelta, &entry_path, patch_path, &patched_path)?;
-    log_step_done("Patch", patch_start);
+    let entry_info = &bundle.entries()[entry_index];
+    eprintln!(
+        "Selected entry: {} ({} bytes)",
+        entry_info.path, entry_info.size
+    );
+
+    let patched_path = if let Some(path) = patched_path_opt {
+        path
+    } else {
+        let entry_path = work_path.join("entry.bin");
+        let extract_start = log_step_start("Extracting entry");
+        bundle.extract_entry(&data_path, entry_index, &entry_path)?;
+        log_step_done("Extract", extract_start);
+
+        let patched_path = work_path.join("entry_patched.bin");
+        let patch_start = log_step_start("Applying xdelta patch");
+        run_xdelta(xdelta, &entry_path, patch_path, &patched_path)?;
+        log_step_done("Patch", patch_start);
+        patched_path
+    };
 
     let rebuilt_data_path = work_path.join("bundle_patched.data");
     let rebuild_start = log_step_start("Rebuilding bundle");
@@ -289,6 +301,59 @@ fn print_entries(entries: &[DirectoryEntry]) {
     }
 }
 
+fn auto_detect_entry(
+    bundle: &UnityFsBundle,
+    data_path: &Path,
+    patch_path: &Path,
+    work_path: &Path,
+    xdelta: &Path,
+    keep_work: bool,
+) -> Result<(usize, Option<PathBuf>)> {
+    let detect_start = log_step_start("Auto-detecting patch target");
+    let entry_path = work_path.join("entry_candidate.bin");
+    let mut matches: Vec<(usize, String, PathBuf)> = Vec::new();
+
+    for (idx, entry) in bundle.entries().iter().enumerate() {
+        bundle.extract_entry(data_path, idx, &entry_path)?;
+        let patched_path = work_path.join(format!("entry_patched_{idx}.bin"));
+        let ok = try_xdelta(xdelta, &entry_path, patch_path, &patched_path)?;
+        if ok {
+            matches.push((idx, entry.path.clone(), patched_path));
+        } else {
+            fs::remove_file(&patched_path).ok();
+        }
+    }
+
+    log_step_done("Auto-detect", detect_start);
+
+    match matches.len() {
+        0 => bail!("Patch did not apply to any entry. Use --list-entries and --entry."),
+        1 => {
+            let (idx, path, patched_path) = matches.pop().unwrap();
+            eprintln!("Auto-detected entry: {}", path);
+            Ok((idx, Some(patched_path)))
+        }
+        _ => {
+            let preview = matches
+                .iter()
+                .take(5)
+                .map(|(_, path, _)| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !keep_work {
+                for (_, _, path) in &matches {
+                    fs::remove_file(path).ok();
+                }
+            }
+            bail!(
+                "Patch applied to multiple entries ({}). Use --entry. Matches: {}",
+                matches.len(),
+                preview
+            );
+        }
+    }
+}
+
 fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Result<()> {
     if output.exists() {
         fs::remove_file(output)
@@ -312,6 +377,32 @@ fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Resu
     }
 
     Ok(())
+}
+
+fn try_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Result<bool> {
+    if output.exists() {
+        fs::remove_file(output)
+            .with_context(|| format!("Remove existing file: {}", output.display()))?;
+    }
+
+    let status = Command::new(xdelta)
+        .arg("-d")
+        .arg("-s")
+        .arg(source)
+        .arg(patch)
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("Run xdelta3 on {}", patch.display()))?;
+
+    if !status.success() {
+        fs::remove_file(output).ok();
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 fn log_step_start(label: &str) -> Instant {

@@ -14,7 +14,9 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d
 
 `patch.xdelta`는 반드시 파일이어야 합니다. 디렉터리는 오류가 납니다.
 번들에 엔트리가 여러 개면 `--entry`로 패치할 파일을 선택하세요
-(`--list-entries`로 전체 경로 목록을 확인할 수 있습니다).
+(`--list-entries`로 전체 경로 목록을 확인할 수 있습니다). `--entry`를
+지정하지 않으면 모든 엔트리에 패치를 시도하고, 정확히 1개만 매칭돼야
+합니다.
 
 목록 확인 및 대상 선택:
 

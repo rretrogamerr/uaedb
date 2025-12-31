@@ -34,7 +34,8 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d
 
 `patch.xdelta` must be a file. Directories are rejected with an error.
 If a bundle contains multiple entries, pass `--entry` to select which file
-to patch (use `--list-entries` to see all paths).
+to patch (use `--list-entries` to see all paths). Without `--entry`, UAEDB
+tries each entry with the patch and requires exactly one match.
 
 Example patch creation:
 
