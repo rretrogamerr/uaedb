@@ -247,7 +247,7 @@ fn apply_patch_path(
         patched_bundle.decompress_to_file(&patched_bundle_path, &data_path)?;
         log_step_done("Extract", extract_start);
 
-        let (data_flags, _) = apply_packer(
+        let (data_flags, block_info_flags) = apply_packer(
             bundle.flags(),
             bundle.block_info_flags(),
             packer,
@@ -259,6 +259,7 @@ fn apply_patch_path(
             &data_path,
             patched_bundle.entries(),
             data_flags,
+            block_info_flags,
             patched_bundle.blocks(),
         )?;
         log_step_done("Rebuild", rebuild_start);

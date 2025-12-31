@@ -447,10 +447,11 @@ impl UnityFsBundle {
         data_path: &Path,
         entries: &[DirectoryEntry],
         data_flags: u32,
+        block_info_flags: u16,
         block_layout: &[BlockInfo],
     ) -> Result<()> {
-        let compression = data_flags & COMP_MASK;
-        if compression == COMP_LZHAM {
+        let data_info_compression = data_flags & COMP_MASK;
+        if data_info_compression == COMP_LZHAM {
             bail!("LZHAM compression is not supported.");
         }
         if data_flags & FLAG_BLOCKS_AND_DIR == 0 {
@@ -473,13 +474,13 @@ impl UnityFsBundle {
             data_path,
             &compressed_data_path,
             block_layout,
-            compression,
+            block_info_flags,
         )?;
 
         let block_info_bytes = build_block_info_bytes(&block_info, entries)?;
         let uncompressed_block_info_size = block_info_bytes.len() as u32;
         let compressed_block_info_bytes =
-            compress_block_info(&block_info_bytes, compression)?;
+            compress_block_info(&block_info_bytes, data_info_compression)?;
         let compressed_block_info_size = compressed_block_info_bytes.len() as u32;
 
         let mut output = BufWriter::new(
@@ -652,8 +653,9 @@ fn compress_data_blocks_with_layout(
     data_path: &Path,
     output_path: &Path,
     layout: &[BlockInfo],
-    compression: u32,
+    block_info_flags: u16,
 ) -> Result<Vec<BlockInfo>> {
+    let compression = (block_info_flags as u32) & COMP_MASK;
     let data_len = std::fs::metadata(data_path)
         .with_context(|| format!("Stat data: {}", data_path.display()))?
         .len();
