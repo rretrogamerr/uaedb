@@ -85,7 +85,6 @@ jobs:
           $vcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } elseif ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
           $triplet = if ($env:VCPKG_TRIPLET) { $env:VCPKG_TRIPLET } else { "x64-windows-static" }
           $includeDir = Join-Path $vcpkgRoot "installed\$triplet\include"
-          $libDir = Join-Path $vcpkgRoot "installed\$triplet\lib"
           $propsPath = Join-Path $env:GITHUB_WORKSPACE "xdelta-build.props"
           $propsLines = @(
             '<Project>'
@@ -94,14 +93,26 @@ jobs:
             "      <PreprocessorDefinitions>%(PreprocessorDefinitions);SIZEOF_SIZE_T=8;SIZEOF_UNSIGNED_LONG_LONG=8</PreprocessorDefinitions>"
             "      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$includeDir</AdditionalIncludeDirectories>"
             '    </ClCompile>'
-            '    <Link>'
-            "      <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories);$libDir</AdditionalLibraryDirectories>"
-            '      <AdditionalDependencies>%(AdditionalDependencies);lzma.lib</AdditionalDependencies>'
-            '    </Link>'
             '  </ItemDefinitionGroup>'
             '</Project>'
           )
           Set-Content -Path $propsPath -Value $propsLines -Encoding utf8
+
+      - name: Stage liblzma for xdelta
+        shell: pwsh
+        run: |
+          $vcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } elseif ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
+          $triplet = if ($env:VCPKG_TRIPLET) { $env:VCPKG_TRIPLET } else { "x64-windows-static" }
+          $libDir = Join-Path $vcpkgRoot "installed\$triplet\lib"
+          $candidateLibs = @(
+            (Join-Path $libDir "liblzma.lib"),
+            (Join-Path $libDir "lzma.lib")
+          )
+          $sourceLib = $candidateLibs | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sourceLib) { throw "liblzma not found in $libDir" }
+          $destDir = Join-Path $env:GITHUB_WORKSPACE "xdelta\\src\\xz\\bin_x86-64"
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+          Copy-Item $sourceLib (Join-Path $destDir "liblzma_static.lib") -Force
 
       - name: Build xdelta3
         working-directory: xdelta/xdelta3
