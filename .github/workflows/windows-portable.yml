@@ -71,7 +71,7 @@ jobs:
           $installOk = $false
           foreach ($port in @("xz", "liblzma")) {
             try {
-              & "$vcpkgRoot\\vcpkg.exe" install "$port:$triplet"
+              & "$vcpkgRoot\\vcpkg.exe" install "${port}:${triplet}"
               if ($LASTEXITCODE -eq 0) { $installOk = $true; break }
             } catch {
               # try next port name
