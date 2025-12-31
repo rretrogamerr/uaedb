@@ -6,11 +6,11 @@ on:
       unitypy_repo:
         description: "UnityPy repo to clone (owner/repo)"
         required: false
-        default: "rretrogamerr/UnityPy"
+        default: "K0lb3/UnityPy"
       xdelta_repo:
         description: "xdelta repo to clone (owner/repo)"
         required: false
-        default: "rretrogamerr/xdelta"
+        default: "jmacd/xdelta"
   push:
     tags:
       - "v*"
@@ -21,8 +21,8 @@ jobs:
     permissions:
       contents: write
     env:
-      UNITYPY_REPO: ${{ github.event.inputs.unitypy_repo || 'rretrogamerr/UnityPy' }}
-      XDELTA_REPO: ${{ github.event.inputs.xdelta_repo || 'rretrogamerr/xdelta' }}
+      UNITYPY_REPO: ${{ github.event.inputs.unitypy_repo || 'K0lb3/UnityPy' }}
+      XDELTA_REPO: ${{ github.event.inputs.xdelta_repo || 'jmacd/xdelta' }}
     steps:
       - name: Checkout UAEDB
         uses: actions/checkout@v4
