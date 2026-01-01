@@ -17,6 +17,10 @@ uaedb original.unity3d patch.xdelta original_patched.unity3d
 적용하려면 `--entry`를 사용하세요 (`--list-entries`로 전체 경로 목록을
 확인할 수 있습니다).
 
+일반 유저는 게임 폴더에서 `patch.bat`를 실행하면 됩니다. `data.unity3d`와
+`data.xdelta`가 필요하며, `data.unity3d.bak`으로 백업한 뒤 성공 시
+`data.unity3d`를 교체하고 백업은 유지합니다.
+
 목록 확인 및 대상 엔트리 선택:
 
 ```bash

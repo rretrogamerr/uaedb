@@ -32,6 +32,8 @@ pub struct DirectoryEntry {
     pub path: String,
 }
 
+pub type ProgressCallback<'a> = dyn FnMut(u64) + 'a;
+
 #[derive(Debug)]
 pub struct UnityFsBundle {
     signature: String,
@@ -189,7 +191,12 @@ impl UnityFsBundle {
         self.data_start
     }
 
-    pub fn decompress_to_file(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+    pub fn decompress_to_file(
+        &self,
+        input_path: &Path,
+        output_path: &Path,
+        progress: Option<&mut ProgressCallback<'_>>,
+    ) -> Result<()> {
         let mut input = BufReader::new(
             File::open(input_path).with_context(|| format!("Open bundle: {}", input_path.display()))?,
         );
@@ -204,13 +211,18 @@ impl UnityFsBundle {
                 .with_context(|| format!("Create output: {}", output_path.display()))?,
         );
 
-        decompress_blocks_to_writer(&mut input, &mut output, &self.blocks)?;
+        decompress_blocks_to_writer(&mut input, &mut output, &self.blocks, progress)?;
 
         output.flush()?;
         Ok(())
     }
 
-    pub fn unpack_to_file(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+    pub fn unpack_to_file(
+        &self,
+        input_path: &Path,
+        output_path: &Path,
+        progress: Option<&mut ProgressCallback<'_>>,
+    ) -> Result<()> {
         let mut input = BufReader::new(
             File::open(input_path).with_context(|| format!("Open bundle: {}", input_path.display()))?,
         );
@@ -261,14 +273,14 @@ impl UnityFsBundle {
             if block_info_need_padding {
                 align_writer(&mut output, 16)?;
             }
-            decompress_blocks_to_writer(&mut input, &mut output, &self.blocks)?;
+            decompress_blocks_to_writer(&mut input, &mut output, &self.blocks, progress)?;
             output.write_all(&block_info_bytes)?;
         } else {
             output.write_all(&block_info_bytes)?;
             if block_info_need_padding {
                 align_writer(&mut output, 16)?;
             }
-            decompress_blocks_to_writer(&mut input, &mut output, &self.blocks)?;
+            decompress_blocks_to_writer(&mut input, &mut output, &self.blocks, progress)?;
         }
 
         output.flush()?;
@@ -286,6 +298,7 @@ impl UnityFsBundle {
         data_path: &Path,
         entry_index: usize,
         output_path: &Path,
+        progress: Option<&mut ProgressCallback<'_>>,
     ) -> Result<()> {
         let entry = self
             .entries
@@ -303,7 +316,7 @@ impl UnityFsBundle {
             File::create(output_path)
                 .with_context(|| format!("Create entry: {}", output_path.display()))?,
         );
-        copy_exact(&mut input, &mut output, entry.size)?;
+        copy_exact_with_progress(&mut input, &mut output, entry.size, progress, 0)?;
         output.flush()?;
         Ok(())
     }
@@ -314,6 +327,7 @@ impl UnityFsBundle {
         entry_index: usize,
         patched_entry: &Path,
         output_path: &Path,
+        mut progress: Option<&mut ProgressCallback<'_>>,
     ) -> Result<Vec<DirectoryEntry>> {
         let mut input = BufReader::new(
             File::open(data_path).with_context(|| format!("Open data: {}", data_path.display()))?,
@@ -328,6 +342,7 @@ impl UnityFsBundle {
         );
 
         let mut offset = 0u64;
+        let mut done = 0u64;
         let mut new_entries = Vec::with_capacity(self.entries.len());
         let patched_size = std::fs::metadata(patched_entry)
             .with_context(|| format!("Stat patched entry: {}", patched_entry.display()))?
@@ -339,11 +354,23 @@ impl UnityFsBundle {
                     File::open(patched_entry)
                         .with_context(|| format!("Open patched entry: {}", patched_entry.display()))?,
                 );
-                io::copy(&mut patched, &mut output)?;
+                done = copy_exact_with_progress(
+                    &mut patched,
+                    &mut output,
+                    patched_size,
+                    progress.as_deref_mut(),
+                    done,
+                )?;
                 patched_size
             } else {
                 input.seek(SeekFrom::Start(entry.offset))?;
-                copy_exact(&mut input, &mut output, entry.size)?;
+                done = copy_exact_with_progress(
+                    &mut input,
+                    &mut output,
+                    entry.size,
+                    progress.as_deref_mut(),
+                    done,
+                )?;
                 entry.size
             };
 
@@ -369,6 +396,7 @@ impl UnityFsBundle {
         entries: &[DirectoryEntry],
         data_flags: u32,
         block_info_flags: u16,
+        progress: Option<&mut ProgressCallback<'_>>,
     ) -> Result<()> {
         let compression = data_flags & COMP_MASK;
         if compression == COMP_LZHAM {
@@ -387,11 +415,8 @@ impl UnityFsBundle {
             .unwrap_or_else(|| PathBuf::from("."));
         let compressed_data_path = work_dir.join("uaedb-data.compressed");
 
-        let block_info = compress_data_blocks(
-            data_path,
-            &compressed_data_path,
-            block_info_flags,
-        )?;
+        let block_info =
+            compress_data_blocks(data_path, &compressed_data_path, block_info_flags, progress)?;
 
         let block_info_bytes = build_block_info_bytes(&block_info, entries)?;
         let uncompressed_block_info_size = block_info_bytes.len() as u32;
@@ -453,6 +478,7 @@ impl UnityFsBundle {
         data_flags: u32,
         block_info_flags: u16,
         block_layout: &[BlockInfo],
+        progress: Option<&mut ProgressCallback<'_>>,
     ) -> Result<()> {
         let data_info_compression = data_flags & COMP_MASK;
         if data_info_compression == COMP_LZHAM {
@@ -479,6 +505,7 @@ impl UnityFsBundle {
             &compressed_data_path,
             block_layout,
             block_info_flags,
+            progress,
         )?;
 
         let block_info_bytes = build_block_info_bytes(&block_info, entries)?;
@@ -567,6 +594,7 @@ fn compress_data_blocks(
     data_path: &Path,
     output_path: &Path,
     block_info_flags: u16,
+    mut progress: Option<&mut ProgressCallback<'_>>,
 ) -> Result<Vec<BlockInfo>> {
     let compression = (block_info_flags as u32) & COMP_MASK;
     let data_len = std::fs::metadata(data_path)
@@ -623,6 +651,7 @@ fn compress_data_blocks(
     let chunk_size: usize = 0x0002_0000;
     let mut block_info = Vec::new();
     let mut remaining = data_len;
+    let mut done = 0u64;
 
     while remaining > 0 {
         let size = std::cmp::min(remaining as usize, chunk_size);
@@ -647,6 +676,12 @@ fn compress_data_blocks(
         remaining = remaining
             .checked_sub(size as u64)
             .context("Chunk size overflow")?;
+        done = done
+            .checked_add(size as u64)
+            .context("Data size overflow")?;
+        if let Some(callback) = progress.as_deref_mut() {
+            callback(done);
+        }
     }
 
     output.flush()?;
@@ -658,6 +693,7 @@ fn compress_data_blocks_with_layout(
     output_path: &Path,
     layout: &[BlockInfo],
     block_info_flags: u16,
+    mut progress: Option<&mut ProgressCallback<'_>>,
 ) -> Result<Vec<BlockInfo>> {
     let compression = (block_info_flags as u32) & COMP_MASK;
     let data_len = std::fs::metadata(data_path)
@@ -684,6 +720,7 @@ fn compress_data_blocks_with_layout(
     );
 
     let mut block_info = Vec::with_capacity(layout.len());
+    let mut done = 0u64;
 
     for block in layout {
         let size = block.uncompressed_size as usize;
@@ -746,6 +783,12 @@ fn compress_data_blocks_with_layout(
             }
             COMP_LZHAM => bail!("LZHAM compression is not supported."),
             _ => bail!("Unsupported compression flag: {}", compression),
+        }
+        done = done
+            .checked_add(size as u64)
+            .context("Data size overflow")?;
+        if let Some(callback) = progress.as_deref_mut() {
+            callback(done);
         }
     }
 
@@ -899,27 +942,47 @@ fn copy_file_to_writer(input_path: &Path, output: &mut BufWriter<File>) -> Resul
     Ok(())
 }
 
-fn copy_exact<R: Read, W: Write>(input: &mut R, output: &mut W, mut size: u64) -> Result<()> {
+fn copy_exact_with_progress<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    mut size: u64,
+    mut progress: Option<&mut ProgressCallback<'_>>,
+    mut done: u64,
+) -> Result<u64> {
     let mut buffer = vec![0u8; 1024 * 1024];
     while size > 0 {
         let read_size = std::cmp::min(size as usize, buffer.len());
         input.read_exact(&mut buffer[..read_size])?;
         output.write_all(&buffer[..read_size])?;
         size -= read_size as u64;
+        done = done
+            .checked_add(read_size as u64)
+            .context("Data size overflow")?;
+        if let Some(callback) = progress.as_deref_mut() {
+            callback(done);
+        }
     }
-    Ok(())
+    Ok(done)
 }
 
 fn decompress_blocks_to_writer<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
     blocks: &[BlockInfo],
+    mut progress: Option<&mut ProgressCallback<'_>>,
 ) -> Result<()> {
+    let mut done = 0u64;
     for block in blocks {
         let comp_flag = (block.flags as u32) & COMP_MASK;
         match comp_flag {
             COMP_NONE => {
-                copy_exact(input, output, block.uncompressed_size as u64)?;
+                done = copy_exact_with_progress(
+                    input,
+                    output,
+                    block.uncompressed_size as u64,
+                    progress.as_deref_mut(),
+                    done,
+                )?;
             }
             COMP_LZ4 | COMP_LZ4HC => {
                 let mut compressed = vec![0u8; block.compressed_size as usize];
@@ -927,6 +990,12 @@ fn decompress_blocks_to_writer<R: Read, W: Write>(
                 let data = lz4_decompress(&compressed, block.uncompressed_size as usize)
                     .context("LZ4 decompress failed")?;
                 output.write_all(&data)?;
+                done = done
+                    .checked_add(block.uncompressed_size as u64)
+                    .context("Data size overflow")?;
+                if let Some(callback) = progress.as_deref_mut() {
+                    callback(done);
+                }
             }
             COMP_LZMA => {
                 if block.compressed_size < 5 {
@@ -938,6 +1007,12 @@ fn decompress_blocks_to_writer<R: Read, W: Write>(
                 let mut limited = input.by_ref().take(remaining);
                 lzma_decompress_to_writer(&header, &mut limited, block.uncompressed_size as u64, output)
                     .context("LZMA decompress failed")?;
+                done = done
+                    .checked_add(block.uncompressed_size as u64)
+                    .context("Data size overflow")?;
+                if let Some(callback) = progress.as_deref_mut() {
+                    callback(done);
+                }
             }
             COMP_LZHAM => bail!("LZHAM compression is not supported."),
             _ => bail!("Unknown compression flag: {}", comp_flag),

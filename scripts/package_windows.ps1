@@ -78,6 +78,7 @@ New-Item -ItemType Directory -Force -Path "$OutputDir\\docs" | Out-Null
 New-Item -ItemType Directory -Force -Path "$OutputDir\\licenses" | Out-Null
 
 Copy-Item "$root\\target\\release\\uaedb.exe" "$OutputDir\\uaedb.exe"
+Copy-Item "$root\\patch.bat" "$OutputDir\\patch.bat"
 Copy-Item "$root\\docs\\USAGE.md" "$OutputDir\\docs\\USAGE.md"
 Copy-Item "$root\\docs\\USAGE_KO.md" "$OutputDir\\docs\\USAGE_KO.md"
 

@@ -4,7 +4,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -129,9 +130,13 @@ fn uncompress_only(input: &Path, output: &Path) -> Result<()> {
     }
 
     let bundle = UnityFsBundle::read(input)?;
-    let decompress_start = log_step_start("Uncompressing bundle");
-    bundle.unpack_to_file(input, output)?;
-    log_step_done("Uncompress", decompress_start);
+    let total = total_uncompressed_bytes(bundle.blocks());
+    let mut progress = StepProgress::new("Uncompressing bundle", total);
+    {
+        let mut callback = |done| progress.update(done);
+        bundle.unpack_to_file(input, output, Some(&mut callback))?;
+    }
+    progress.finish("Uncompress");
     Ok(())
 }
 
@@ -187,9 +192,13 @@ fn apply_patch_path(
 
     if let Some(entry) = entry {
         let data_path = work_path.join("bundle.data");
-        let decompress_start = log_step_start("Uncompressing bundle data");
-        bundle.decompress_to_file(input, &data_path)?;
-        log_step_done("Uncompress", decompress_start);
+        let total = total_uncompressed_bytes(bundle.blocks());
+        let mut progress = StepProgress::new("Uncompressing bundle data", total);
+        {
+            let mut callback = |done| progress.update(done);
+            bundle.decompress_to_file(input, &data_path, Some(&mut callback))?;
+        }
+        progress.finish("Uncompress");
 
         let (entry_index, _) = select_entry(bundle.entries(), Some(entry))?;
         let entry_info = &bundle.entries()[entry_index];
@@ -199,23 +208,37 @@ fn apply_patch_path(
         );
 
         let entry_path = work_path.join("entry.bin");
-        let extract_start = log_step_start("Extracting entry");
-        bundle.extract_entry(&data_path, entry_index, &entry_path)?;
-        log_step_done("Extract", extract_start);
+        let mut progress = StepProgress::new("Extracting entry", entry_info.size);
+        {
+            let mut callback = |done| progress.update(done);
+            bundle.extract_entry(&data_path, entry_index, &entry_path, Some(&mut callback))?;
+        }
+        progress.finish("Extract");
 
         let patched_path = work_path.join("entry_patched.bin");
-        let patch_start = log_step_start("Applying xdelta patch");
         run_xdelta(xdelta, &entry_path, patch_path, &patched_path)?;
-        log_step_done("Patch", patch_start);
 
         let rebuilt_data_path = work_path.join("bundle_patched.data");
-        let rebuild_start = log_step_start("Rebuilding bundle");
-        let new_entries = bundle.rebuild_data_file(
-            &data_path,
-            entry_index,
-            &patched_path,
-            &rebuilt_data_path,
-        )?;
+        let patched_size = fs::metadata(&patched_path)
+            .with_context(|| format!("Stat patched entry: {}", patched_path.display()))?
+            .len();
+        let original_total: u64 = bundle.entries().iter().map(|item| item.size).sum();
+        let rebuilt_total = original_total
+            .checked_sub(entry_info.size)
+            .and_then(|size| size.checked_add(patched_size))
+            .context("Compute rebuilt data size")?;
+        let mut progress = StepProgress::new("Rebuilding data", rebuilt_total);
+        let new_entries = {
+            let mut callback = |done| progress.update(done);
+            bundle.rebuild_data_file(
+                &data_path,
+                entry_index,
+                &patched_path,
+                &rebuilt_data_path,
+                Some(&mut callback),
+            )?
+        };
+        progress.finish("Rebuild data");
 
         let (data_flags, block_info_flags) = apply_packer(
             bundle.flags(),
@@ -223,32 +246,41 @@ fn apply_patch_path(
             packer,
         );
 
-        bundle.write_bundle(
-            out,
-            &rebuilt_data_path,
-            &new_entries,
-            data_flags,
-            block_info_flags,
-        )?;
-        log_step_done("Rebuild", rebuild_start);
+        let data_len = fs::metadata(&rebuilt_data_path)
+            .with_context(|| format!("Stat rebuilt data: {}", rebuilt_data_path.display()))?
+            .len();
+        let mut progress = StepProgress::new("Rebuilding bundle", data_len);
+        {
+            let mut callback = |done| progress.update(done);
+            bundle.write_bundle(
+                out,
+                &rebuilt_data_path,
+                &new_entries,
+                data_flags,
+                block_info_flags,
+                Some(&mut callback),
+            )?;
+        }
+        progress.finish("Rebuild bundle");
     } else {
         let uncompressed_path = work_path.join("bundle.uncompressed");
-        let unpack_start = log_step_start("Uncompressing bundle");
-        bundle.unpack_to_file(input, &uncompressed_path)?;
-        log_step_done("Uncompress", unpack_start);
+        let total = total_uncompressed_bytes(bundle.blocks());
+        let mut progress = StepProgress::new("Uncompressing bundle", total);
+        {
+            let mut callback = |done| progress.update(done);
+            bundle.unpack_to_file(input, &uncompressed_path, Some(&mut callback))?;
+        }
+        progress.finish("Uncompress");
 
         let uncompressed_bundle =
             UnityFsBundle::read(&uncompressed_path).context("Read uncompressed bundle")?;
 
         let patched_bundle_path = work_path.join("bundle_patched.uncompressed");
-        let patch_start = log_step_start("Applying xdelta patch");
         run_xdelta(xdelta, &uncompressed_path, patch_path, &patched_bundle_path)?;
-        log_step_done("Patch", patch_start);
 
         let patched_bundle =
             UnityFsBundle::read(&patched_bundle_path).context("Read patched bundle")?;
         let data_path = work_path.join("bundle.data");
-        let extract_start = log_step_start("Extracting data");
         let max_entry_end = patched_bundle
             .entries()
             .iter()
@@ -281,12 +313,32 @@ fn apply_patch_path(
                     max_entry_end
                 );
             }
-            extract_raw_data(&patched_bundle_path, start, len, &data_path)?;
+            let mut progress = StepProgress::new("Extracting data", len);
+            {
+                let mut callback = |done| progress.update(done);
+                extract_raw_data(
+                    &patched_bundle_path,
+                    start,
+                    len,
+                    &data_path,
+                    Some(&mut callback),
+                )?;
+            }
+            progress.finish("Extract");
             data_len = Some(len);
         } else {
-            patched_bundle.decompress_to_file(&patched_bundle_path, &data_path)?;
+            let total = total_uncompressed_bytes(patched_bundle.blocks());
+            let mut progress = StepProgress::new("Extracting data", total);
+            {
+                let mut callback = |done| progress.update(done);
+                patched_bundle.decompress_to_file(
+                    &patched_bundle_path,
+                    &data_path,
+                    Some(&mut callback),
+                )?;
+            }
+            progress.finish("Extract");
         }
-        log_step_done("Extract", extract_start);
 
         let (data_flags, block_info_flags) = apply_packer(
             bundle.flags(),
@@ -294,43 +346,54 @@ fn apply_patch_path(
             packer,
         );
 
-        let rebuild_start = log_step_start("Rebuilding bundle");
-        if use_raw_data {
-            let layout_total: u64 = uncompressed_bundle
-                .blocks()
-                .iter()
-                .map(|block| block.uncompressed_size as u64)
-                .sum();
-            let data_len = data_len.unwrap_or(layout_total);
-            if data_len == layout_total {
+        let data_len = match data_len {
+            Some(len) => len,
+            None => fs::metadata(&data_path)
+                .with_context(|| format!("Stat data: {}", data_path.display()))?
+                .len(),
+        };
+        let mut progress = StepProgress::new("Rebuilding bundle", data_len);
+        {
+            let mut callback = |done| progress.update(done);
+            if use_raw_data {
+                let layout_total: u64 = uncompressed_bundle
+                    .blocks()
+                    .iter()
+                    .map(|block| block.uncompressed_size as u64)
+                    .sum();
+                if data_len == layout_total {
+                    patched_bundle.write_bundle_with_layout(
+                        out,
+                        &data_path,
+                        patched_bundle.entries(),
+                        data_flags,
+                        block_info_flags,
+                        uncompressed_bundle.blocks(),
+                        Some(&mut callback),
+                    )?;
+                } else {
+                    patched_bundle.write_bundle(
+                        out,
+                        &data_path,
+                        patched_bundle.entries(),
+                        data_flags,
+                        block_info_flags,
+                        Some(&mut callback),
+                    )?;
+                }
+            } else {
                 patched_bundle.write_bundle_with_layout(
                     out,
                     &data_path,
                     patched_bundle.entries(),
                     data_flags,
                     block_info_flags,
-                    uncompressed_bundle.blocks(),
-                )?;
-            } else {
-                patched_bundle.write_bundle(
-                    out,
-                    &data_path,
-                    patched_bundle.entries(),
-                    data_flags,
-                    block_info_flags,
+                    patched_bundle.blocks(),
+                    Some(&mut callback),
                 )?;
             }
-        } else {
-            patched_bundle.write_bundle_with_layout(
-                out,
-                &data_path,
-                patched_bundle.entries(),
-                data_flags,
-                block_info_flags,
-                patched_bundle.blocks(),
-            )?;
         }
-        log_step_done("Rebuild", rebuild_start);
+        progress.finish("Rebuild bundle");
     }
 
     if keep_work {
@@ -351,7 +414,71 @@ fn apply_packer(flags: u32, block_info_flags: u16, packer: Packer) -> (u32, u16)
     (new_flags, new_block_info_flags)
 }
 
-fn extract_raw_data(input_path: &Path, start: u64, len: u64, output_path: &Path) -> Result<()> {
+const SPINNER_FRAMES: [char; 4] = ['\\', '|', '/', '-'];
+
+struct StepProgress {
+    label: String,
+    total: u64,
+    start: Instant,
+    spinner_idx: usize,
+    last_render: Instant,
+}
+
+impl StepProgress {
+    fn new(label: &str, total: u64) -> Self {
+        let now = Instant::now();
+        let last_render = now
+            .checked_sub(Duration::from_millis(200))
+            .unwrap_or(now);
+        let mut progress = Self {
+            label: label.to_string(),
+            total: total.max(1),
+            start: now,
+            spinner_idx: 0,
+            last_render,
+        };
+        progress.render(0, true);
+        progress
+    }
+
+    fn update(&mut self, done: u64) {
+        self.render(done, false);
+    }
+
+    fn finish(&mut self, done_label: &str) {
+        self.render(self.total, true);
+        eprintln!();
+        eprintln!("{done_label} done in {:.1}s", self.start.elapsed().as_secs_f64());
+    }
+
+    fn render(&mut self, done: u64, force: bool) {
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_render) < Duration::from_millis(120) {
+            return;
+        }
+        let pct = (done.min(self.total) * 100) / self.total;
+        let spinner = SPINNER_FRAMES[self.spinner_idx];
+        self.spinner_idx = (self.spinner_idx + 1) % SPINNER_FRAMES.len();
+        eprint!("\r{} {} {:>3}%", spinner, self.label, pct);
+        let _ = io::stderr().flush();
+        self.last_render = now;
+    }
+}
+
+fn total_uncompressed_bytes(blocks: &[unityfs::BlockInfo]) -> u64 {
+    blocks
+        .iter()
+        .map(|block| block.uncompressed_size as u64)
+        .sum()
+}
+
+fn extract_raw_data(
+    input_path: &Path,
+    start: u64,
+    len: u64,
+    output_path: &Path,
+    mut progress: Option<&mut dyn FnMut(u64)>,
+) -> Result<()> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Create dir: {}", parent.display()))?;
@@ -365,7 +492,21 @@ fn extract_raw_data(input_path: &Path, start: u64, len: u64, output_path: &Path)
             .with_context(|| format!("Create output: {}", output_path.display()))?,
     );
     let mut limited = input.take(len);
-    io::copy(&mut limited, &mut output)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut done = 0u64;
+    loop {
+        let read = limited.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        done = done
+            .checked_add(read as u64)
+            .context("Data size overflow")?;
+        if let Some(callback) = progress.as_deref_mut() {
+            callback(done);
+        }
+    }
     output.flush()?;
     Ok(())
 }
@@ -453,7 +594,14 @@ fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Resu
             .with_context(|| format!("Remove existing file: {}", output.display()))?;
     }
 
-    let status = Command::new(xdelta)
+    let total = fs::metadata(source)
+        .with_context(|| format!("Stat source: {}", source.display()))?
+        .len()
+        .max(1);
+    let mut progress = StepProgress::new("Applying xdelta patch", total);
+    let mut last_done = 0u64;
+
+    let mut child = Command::new(xdelta)
         .arg("-d")
         .arg("-s")
         .arg(source)
@@ -462,21 +610,25 @@ fn run_xdelta(xdelta: &Path, source: &Path, patch: &Path, output: &Path) -> Resu
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
+        .spawn()
         .with_context(|| format!("Run xdelta3 on {}", patch.display()))?;
 
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let done = fs::metadata(output).map(|meta| meta.len()).unwrap_or(0);
+        last_done = done;
+        progress.update(done.min(total));
+        thread::sleep(Duration::from_millis(120));
+    };
+
     if !status.success() {
+        progress.render(last_done.min(total), true);
+        eprintln!();
         bail!("xdelta failed (exit {}). See output above.", status);
     }
 
+    progress.finish("Patch");
     Ok(())
-}
-
-fn log_step_start(label: &str) -> Instant {
-    eprintln!("{label}...");
-    Instant::now()
-}
-
-fn log_step_done(label: &str, start: Instant) {
-    eprintln!("{label} done in {:.1}s", start.elapsed().as_secs_f64());
 }

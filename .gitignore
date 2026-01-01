@@ -3,3 +3,5 @@
 /dist/
 /runtime/
 /fixtures
+/xdelta3
+.DS_Store

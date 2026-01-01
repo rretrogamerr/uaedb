@@ -37,6 +37,10 @@ By default UAEDB applies the patch to the full uncompressed bundle. Use
 `--entry` to patch a specific entry instead (use `--list-entries` to see
 all paths).
 
+For end users, run `patch.bat` in the game folder. It expects
+`data.unity3d` and `data.xdelta`, creates `data.unity3d.bak`, replaces
+`data.unity3d` on success, and keeps the backup either way.
+
 Example patch creation (uncompressed bundle):
 
 ```bash
