@@ -45,7 +45,10 @@ move /y "%OUT%" "%DATA%" >nul
 if errorlevel 1 goto restore
 
 echo Patch completed.
-echo Backup kept at %BACKUP%.
+echo Removing backup...
+if exist "%BACKUP%" (
+  del /f /q "%BACKUP%"
+)
 exit /b 0
 
 :restore
